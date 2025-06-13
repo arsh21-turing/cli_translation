@@ -1,0 +1,26 @@
+# Core NLP and embedding dependencies
+transformers>=4.28.0
+sentence-transformers>=2.2.2
+torch>=2.0.0
+
+# Language processing and detection
+langdetect>=1.0.9
+nltk>=3.8.1
+
+# API integration
+groq>=0.4.0
+requests>=2.28.0
+
+# Vector operations and storage
+numpy>=1.24.0
+faiss-cpu>=1.7.4  # For efficient vector similarity search
+
+# CLI enhancements
+rich>=13.3.0  # For fancy terminal output
+typer>=0.9.0  # Optional CLI builder on top of Click
+tqdm>=4.65.0  # For progress bars
+
+# Development and testing
+pytest>=7.3.1
+black>=23.3.0
+pylint>=2.17.0
