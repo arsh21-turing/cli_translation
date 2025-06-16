@@ -19,6 +19,11 @@ from transformers import AutoModel, AutoTokenizer, AutoModelForSeq2SeqLM
 from sentence_transformers import SentenceTransformer
 
 from config_manager import ConfigManager
+from language_utils import LanguageDetector, get_supported_languages
+
+# Configure logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
 
 class ModelType(Enum):
     """Enumeration of supported model types"""
@@ -417,4 +422,114 @@ class ModelLoader:
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
             
-        self.logger.info("Model cache cleared") 
+        self.logger.info("Model cache cleared")
+
+    def load_sentence_transformer_model(self, model_name: str) -> SentenceTransformer:
+        """
+        Load a SentenceTransformer model by name.
+        
+        Args:
+            model_name (str): The name of the model to load.
+            
+        Returns:
+            SentenceTransformer: The loaded model.
+        """
+        # Check if model is already loaded
+        cache_key = f"embedding_{model_name}"
+        if cache_key in self._model_cache:
+            return self._model_cache[cache_key]
+        
+        # Try to load model
+        try:
+            self.logger.info(f"Loading SentenceTransformer model: {model_name}")
+            model = SentenceTransformer(model_name, cache_folder=str(self.models_dir))
+            model.to(self.device)
+            self._model_cache[cache_key] = model
+            return model
+        except Exception as e:
+            self.logger.error(f"Error loading SentenceTransformer model {model_name}: {e}")
+            raise ValueError(f"Failed to load SentenceTransformer model: {model_name}")
+
+class MultilingualModelManager:
+    """Manager for specialized multilingual embedding models."""
+    
+    # Default multilingual model
+    DEFAULT_MULTILINGUAL_MODEL = "paraphrase-multilingual-MiniLM-L12-v2"
+    
+    # Alternative models for different language needs
+    MULTILINGUAL_MODELS = {
+        "default": "paraphrase-multilingual-MiniLM-L12-v2",  # Balanced size/performance
+        "high_quality": "paraphrase-multilingual-mpnet-base-v2",  # Higher quality, larger
+        "efficient": "distiluse-base-multilingual-cased-v2"  # Smaller, faster
+    }
+    
+    def __init__(self, config_manager, model_loader):
+        """Initialize with config and model loader references."""
+        self.config = config_manager
+        self.model_loader = model_loader
+        self.language_detector = LanguageDetector()
+        self.loaded_models = {}
+        # Initialize logger for this class
+        self.logger = logging.getLogger("tqa.multilingual")
+        
+        # Initialize with default multilingual model
+        self._load_default_model()
+    
+    def _load_default_model(self):
+        """Load the default multilingual model."""
+        model_name = self.MULTILINGUAL_MODELS["default"]
+        try:
+            model = self.model_loader.load_sentence_transformer_model(model_name)
+            self.loaded_models["default"] = model
+            self.logger.info(f"Loaded default multilingual model: {model_name}")
+        except Exception as e:
+            self.logger.error(f"Failed to load default multilingual model: {e}")
+    
+    def get_model(self, source_lang: str = None, target_lang: str = None) -> SentenceTransformer:
+        """
+        Get the best model for a language pair.
+        
+        Args:
+            source_lang (str, optional): Source language code
+            target_lang (str, optional): Target language code
+            
+        Returns:
+            SentenceTransformer: Model for the language pair
+        """
+        # If no languages specified, return default model
+        if not source_lang or not target_lang:
+            return self.loaded_models.get("default")
+            
+        # Get optimized model recommendation
+        model_name = self.language_detector.get_optimal_model(source_lang, target_lang)
+        
+        # Check if we already have this model loaded
+        if model_name in self.loaded_models:
+            return self.loaded_models[model_name]
+        
+        # Load the model if it's not already loaded
+        try:
+            model = self.model_loader.load_sentence_transformer_model(model_name)
+            self.loaded_models[model_name] = model
+            self.logger.info(f"Loaded model {model_name} for {source_lang}-{target_lang} pair")
+            return model
+        except Exception as e:
+            self.logger.error(f"Error loading model {model_name}: {e}")
+            # Fallback to default
+            return self.loaded_models.get("default")
+    
+    def get_supported_languages(self) -> List[Dict]:
+        """Get list of supported languages for the embedding models."""
+        return get_supported_languages()
+    
+    def detect_language(self, text: str) -> Dict:
+        """
+        Detect the language of a piece of text.
+        
+        Args:
+            text (str): Text to analyze
+            
+        Returns:
+            Dict: Language detection results
+        """
+        return self.language_detector.detect(text) 
