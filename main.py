@@ -9,6 +9,8 @@ import os
 import argparse
 import logging
 import time
+import html as _html_mod
+import datetime
 from pathlib import Path
 from typing import List, Dict, Union, Optional, Any
 import textwrap
@@ -27,6 +29,67 @@ from embedding_generator import MultilingualEmbeddingGenerator
 from similarity_calculator import SimilarityCalculator
 from language_utils import LanguageDetector, EmbeddingBasedLanguageDetector, get_supported_languages
 from analyzer import TranslationQualityAnalyzer
+
+# Candidate ranking relies on additional utilities
+# Import optional dependencies lazily to avoid overhead when not used.
+from translation_ranker import calculate_translation_confidence
+
+# Extra serialisation libs (optional)
+import yaml  # Added for YAML output support
+
+# -----------------------------------------------------------------------------
+# Simple HTML output helper exposed for external import (tests)
+# -----------------------------------------------------------------------------
+
+
+def output_html(
+    data: Dict[str, Any],
+    title: str = "Translation Report",
+    include_diagnostics: bool = False,
+) -> str:
+    """Return a basic HTML document string for *data*.
+
+    The structure is intentionally simple so it renders in any browser and so
+    that automated tests can easily assert on key strings.
+    """
+
+    def esc(s: str) -> str:
+        import html as _h
+        return _h.escape(str(s))
+
+    html_parts: List[str] = [
+        "<!DOCTYPE html>",
+        "<html><head><meta charset='utf-8'><title>" + esc(title) + "</title></head><body>",
+        f"<h1>{esc(title)}</h1>",
+    ]
+
+    if "source_text" in data:
+        html_parts.append("<h2>Source Text</h2><p>" + esc(data["source_text"]) + "</p>")
+
+    # Ranked translations table
+    if data.get("ranked_translations"):
+        html_parts.append("<h2>Ranked Translations</h2>")
+        html_parts.append("<table border='1' cellpadding='4' cellspacing='0'>")
+        html_parts.append("<tr><th>Rank</th><th>Quality</th><th>Similarity</th><th>Confidence</th><th>Translation</th></tr>")
+        for idx, item in enumerate(data["ranked_translations"]):
+            html_parts.append(
+                f"<tr><td>{idx+1}</td><td>{item.get('quality_score',0):.4f}</td>"
+                f"<td>{item.get('similarity',0):.4f}</td><td>{item.get('confidence',0):.4f}</td>"
+                f"<td>{esc(item.get('text') or item.get('translation',''))}</td></tr>"
+            )
+        html_parts.append("</table>")
+
+    if include_diagnostics and data.get("diagnostics"):
+        diag = data["diagnostics"]
+        html_parts.append("<h2>Clustering Diagnostics</h2><ul>")
+        for k, v in diag.items():
+            if isinstance(v, float):
+                v = f"{v:.4f}"
+            html_parts.append(f"<li>{esc(k)}: {esc(v)}</li>")
+        html_parts.append("</ul>")
+
+    html_parts.append("</body></html>")
+    return "\n".join(html_parts)
 
 # Configure logging
 logging.basicConfig(
@@ -194,6 +257,27 @@ def setup_argparser() -> argparse.ArgumentParser:
         choices=['default', 'high_quality', 'efficient'],
         help='Type of multilingual model to use'
     )
+    
+    # Candidate Ranking options
+    ranking_group = parser.add_argument_group('Candidate Ranking')
+    ranking_group.add_argument('--rank-candidates', action='store_true',
+                               help='Rank multiple candidate translations')
+    ranking_group.add_argument('--candidates', type=str,
+                               help='Comma-separated candidate translations')
+    ranking_group.add_argument('--candidates-file', type=str,
+                               help='Path to file with candidate translations (one per line)')
+    ranking_group.add_argument('--confidence-method', type=str,
+                               choices=['distribution', 'gap', 'range'], default='distribution',
+                               help='Confidence scoring method')
+    ranking_group.add_argument('--output-format', type=str,
+                               choices=['table', 'json', 'csv', 'yaml', 'html'], default='table',
+                               help='Output format for ranking results')
+    ranking_group.add_argument('--include-diagnostics', action='store_true',
+                               help='Include clustering diagnostics in the output')
+    ranking_group.add_argument('--output-file', type=str,
+                               help='Save results to a file instead of printing to stdout')
+    ranking_group.add_argument('--model', type=str, default='all-MiniLM-L6-v2',
+                               help='Embedding model to use for ranking')
     
     # Output options
     output_group = parser.add_argument_group('Output Options')
@@ -406,6 +490,10 @@ def main():
     # Set up argument parser
     parser = setup_argparser()
     args = parser.parse_args()
+    
+    # Handle candidate-ranking shortcut early
+    if getattr(args, 'rank_candidates', False):
+        return rank_translations_cli(args)
     
     # Configure logging level
     if args.debug:
@@ -1156,6 +1244,151 @@ def main():
                 
             console.print(table)
     
+    return 0
+
+# -----------------------------------------------------------------------------
+# Candidate ranking helpers (stand-alone to keep existing logic untouched)
+# -----------------------------------------------------------------------------
+
+
+def _read_text_file(path: str) -> str:
+    with open(path, 'r', encoding='utf-8') as fh:
+        return fh.read().strip()
+
+
+def _read_candidates_file(path: str) -> List[str]:
+    with open(path, 'r', encoding='utf-8') as fh:
+        return [line.strip() for line in fh if line.strip()]
+
+
+def _print_table(ranked: List[Dict[str, Any]], source: Optional[str] = None, diagnostics: Optional[Dict[str, Any]] = None) -> None:
+    from tabulate import tabulate  # local import to keep fast startup
+
+    headers = ["Rank", "Similarity", "Confidence", "Translation"]
+    rows = [
+        [i + 1, f"{item['similarity']:.4f}", f"{item['confidence']:.4f}", item['translation' if 'translation' in item else 'text']]  # type: ignore
+        for i, item in enumerate(ranked)
+    ]
+    if source:
+        print(f"Source: {source}\n")
+    print(tabulate(rows, headers=headers, tablefmt="grid"))
+
+    # Diagnostics summary
+    if diagnostics:
+        print("\n=== Clustering Diagnostics ===")
+        print(f"Optimal clusters: {diagnostics.get('optimal_clusters')}")
+        print(f"Cluster sizes: {diagnostics.get('cluster_sizes')}")
+        print(f"Within-cluster cohesion: {diagnostics.get('cluster_cohesion'):.4f}")
+        print(f"Between-cluster separation: {diagnostics.get('cluster_separation'):.4f}")
+        print(f"Variance explained: {diagnostics.get('variance_explained'):.4f}")
+
+def _output_json(result: Dict[str, Any], source: Optional[str]) -> str:
+    import json
+
+    payload = {"source_text": source or "", **result}
+    return json.dumps(payload, indent=2, ensure_ascii=False)
+
+def _output_csv(result: Dict[str, Any], source: Optional[str]) -> str:
+    import csv
+    from io import StringIO
+
+    ranked = result.get("ranked_translations", [])
+    diagnostics = result.get("diagnostics")
+
+    buf = StringIO()
+    writer = csv.writer(buf)
+    writer.writerow(["Rank", "Similarity", "Confidence", "Translation"])
+    if source:
+        writer.writerow(["# Source", source])
+        writer.writerow([])
+    for idx, item in enumerate(ranked):
+        writer.writerow([idx + 1, f"{item['similarity']:.4f}", f"{item['confidence']:.4f}", item['translation' if 'translation' in item else 'text']])  # type: ignore
+
+    if diagnostics:
+        writer.writerow([])
+        writer.writerow(["# Clustering Diagnostics"])
+        writer.writerow(["Optimal clusters", diagnostics.get('optimal_clusters')])
+        writer.writerow(["Cluster sizes", diagnostics.get('cluster_sizes')])
+        writer.writerow(["Within-cluster cohesion", f"{diagnostics.get('cluster_cohesion'):.4f}"])
+        writer.writerow(["Between-cluster separation", f"{diagnostics.get('cluster_separation'):.4f}"])
+        writer.writerow(["Variance explained", f"{diagnostics.get('variance_explained'):.4f}"])
+
+    return buf.getvalue()
+
+def _output_yaml(result: Dict[str, Any], source: Optional[str]) -> str:
+    payload = {"source_text": source or "", **result}
+    return yaml.dump(payload, sort_keys=False, allow_unicode=True)
+
+def _output_html(result: Dict[str, Any], source: Optional[str], include_diag: bool) -> str:
+    payload = {"source_text": source or "", **result}
+    return output_html(payload, include_diagnostics=include_diag)
+
+def rank_translations_cli(args) -> int:
+    """Standalone CLI handler for --rank-candidates."""
+    # Source text
+    if args.source_file:
+        try:
+            source_text = _read_text_file(args.source_file)
+        except FileNotFoundError:
+            print(f"[ERROR] Source file not found: {args.source_file}")
+            return 1
+    elif args.source_text:
+        source_text = args.source_text
+    else:
+        print("[ERROR] Source text is required (use --source-text or --source-file).")
+        return 1
+
+    # Candidate list
+    candidates: List[str] = []
+    if args.candidates_file:
+        try:
+            candidates.extend(_read_candidates_file(args.candidates_file))
+        except FileNotFoundError:
+            print(f"[ERROR] Candidates file not found: {args.candidates_file}")
+            return 1
+    if args.candidates:
+        candidates.extend([c.strip() for c in args.candidates.split(',') if c.strip()])
+
+    if not candidates:
+        print("[ERROR] No candidate translations provided (use --candidates or --candidates-file).")
+        return 1
+
+    result = calculate_translation_confidence(
+        source_text,
+        candidates,
+        model_name=args.model,
+        confidence_method=args.confidence_method,
+        include_diagnostics=args.include_diagnostics,
+    )
+
+    ranked = result["ranked_translations"]
+
+    fmt = args.output_format.lower()
+    if fmt == "json":
+        content = _output_json(result, source_text)
+    elif fmt == "yaml":
+        content = _output_yaml(result, source_text)
+    elif fmt == "csv":
+        content = _output_csv(result, source_text)
+    elif fmt == "html":
+        content = _output_html(result, source_text, args.include_diagnostics)
+    else:
+        _print_table(ranked, source_text, result.get("diagnostics") if args.include_diagnostics else None)
+        content = None
+
+    # Save or print
+    if content is not None:
+        if args.output_file:
+            try:
+                with open(args.output_file, "w", encoding="utf-8") as fh:
+                    fh.write(content)
+                print(f"Results written to {args.output_file}")
+            except Exception as exc:
+                print(f"[ERROR] Could not write to {args.output_file}: {exc}")
+                return 1
+        else:
+            print(content)
+
     return 0
 
 if __name__ == "__main__":
