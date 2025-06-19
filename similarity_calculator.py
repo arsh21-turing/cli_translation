@@ -7,6 +7,30 @@ import time
 
 logger = logging.getLogger("tqa.similarity")
 
+def cosine_similarity(vec1: np.ndarray, vec2: np.ndarray) -> float:
+    """
+    Calculates cosine similarity between two vectors.
+    Normalizes the score to be in the [0, 1] range.
+    """
+    vec1 = np.asarray(vec1).flatten()
+    vec2 = np.asarray(vec2).flatten()
+    
+    if vec1.shape != vec2.shape:
+        raise ValueError("Vectors must have the same shape for cosine similarity.")
+        
+    dot_product = np.dot(vec1, vec2)
+    norm_vec1 = np.linalg.norm(vec1)
+    norm_vec2 = np.linalg.norm(vec2)
+    
+    if norm_vec1 == 0 or norm_vec2 == 0:
+        return 0.0
+        
+    # Standard cosine similarity is in [-1, 1]
+    similarity = dot_product / (norm_vec1 * norm_vec2)
+    
+    # Normalize to [0, 1] range
+    return (similarity + 1) / 2
+
 class SimilarityMetric(Enum):
     """Supported similarity metrics."""
     COSINE = "cosine"

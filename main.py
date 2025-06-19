@@ -225,6 +225,29 @@ def setup_argparser() -> argparse.ArgumentParser:
         help='Generate a detailed analysis report'
     )
     
+    # Groq integration options
+    groq_group = parser.add_argument_group('Groq Options')
+    groq_flags = groq_group.add_mutually_exclusive_group()
+    groq_flags.add_argument(
+        '--use-groq', dest='use_groq', action='store_true', default=None,
+        help='Use Groq LLM for enhanced quality evaluation'
+    )
+    groq_flags.add_argument(
+        '--no-groq', dest='use_groq', action='store_false',
+        help='Disable Groq LLM and rely on embedding-based metrics only'
+    )
+
+    # Alignment analysis options
+    alignment_group = parser.add_argument_group('Alignment Analysis')
+    alignment_group.add_argument(
+        '--weak-alignment', dest='weak_alignment', action='store_true',
+        help='Detect and report weak segment alignments in addition to overall analysis'
+    )
+    alignment_group.add_argument(
+        '--segment-type', dest='segment_type', choices=['sentence', 'paragraph'], default='sentence',
+        help='Segmentation granularity used for alignment analysis'
+    )
+    
     # Configuration options
     config_group = parser.add_argument_group('Configuration Options')
     config_group.add_argument(
@@ -316,6 +339,14 @@ def setup_argparser() -> argparse.ArgumentParser:
     misc_group.add_argument(
         '--clear-cache', action='store_true',
         help='Clear all cached data and exit'
+    )
+    misc_group.add_argument(
+        '--run-alignment-demo', action='store_true',
+        help='Run a demo of segment alignment analysis'
+    )
+    misc_group.add_argument(
+        '--run-weight-demo', action='store_true',
+        help='Run a demo of custom quality score weights'
     )
     
     return parser
@@ -485,12 +516,223 @@ def write_to_file(file_path: str, content: str):
         logger.error(f"Error writing to file {file_path}: {e}")
         return False
 
+def analyze_translation_with_alignment(source_text, translation, use_groq=True, detailed=True, custom_weights=None, config_path=None, segment_type='sentence'):
+    """
+    Analyze translation with segment alignment detection.
+    
+    Args:
+        source_text: Source text
+        translation: Translation to analyze
+        use_groq: Whether to use Groq for enhanced evaluation
+        detailed: Whether to get detailed analysis
+        custom_weights: Custom weights for the analysis
+        config_path: Path to a configuration file
+        segment_type: Segmentation granularity used for alignment analysis
+        
+    Returns:
+        Analysis results with alignment information
+    """
+    from translation_quality_analyzer import TranslationQualityAnalyzer
+    
+    groq_evaluator = None
+    if use_groq:
+        try:
+            from groq_client import GroqClient
+            from groq_evaluator import GroqEvaluator
+            groq_client = GroqClient()
+            groq_evaluator = GroqEvaluator(client=groq_client)
+        except (ImportError, Exception) as e:
+            logger.warning(f"Could not initialize Groq for demo: {e}")
+            use_groq = False
+    
+    # Initialize analyzer
+    analyzer = TranslationQualityAnalyzer(
+        groq_evaluator=groq_evaluator
+    )
+    
+    # Analyze with alignment detection
+    results = analyzer.analyze_pair(
+        source_text=source_text,
+        translation=translation,
+        use_groq=use_groq,
+        detailed=detailed,
+        detect_weak_alignments=True,
+        segment_type=segment_type,
+        custom_weights=custom_weights,
+        config_path=config_path
+    )
+    
+    return results
+
+def compare_translations_with_alignment(source_text, translations, use_groq=True):
+    """
+    Compare multiple translations with segment alignment detection.
+    
+    Args:
+        source_text: Source text
+        translations: List of translations to compare
+        use_groq: Whether to use Groq for enhanced evaluation
+        
+    Returns:
+        Comparison results with alignment information
+    """
+    from translation_quality_analyzer import TranslationQualityAnalyzer
+
+    groq_evaluator = None
+    if use_groq:
+        try:
+            from groq_client import GroqClient
+            from groq_evaluator import GroqEvaluator
+            groq_client = GroqClient()
+            groq_evaluator = GroqEvaluator(client=groq_client)
+        except (ImportError, Exception) as e:
+            logger.warning(f"Could not initialize Groq for demo: {e}")
+            use_groq = False
+    
+    # Initialize analyzer
+    analyzer = TranslationQualityAnalyzer(
+        groq_evaluator=groq_evaluator
+    )
+    
+    # Rank translations with alignment detection
+    results = analyzer.rank_candidates(
+        source_text=source_text,
+        candidates=translations,
+        use_groq=use_groq,
+        detect_weak_alignments=True
+    )
+    
+    return results
+
+def run_alignment_demo(console):
+    """Runs a self-contained demo of the segment alignment functionality."""
+    from segment_alignment import generate_alignment_report
+    
+    console.print(Panel("[bold cyan]Running Segment Alignment Analysis Demo[/bold cyan]"))
+
+    source_text = """
+    The new regulations on carbon emissions will take effect next quarter. 
+    Companies must comply with these standards or face substantial penalties.
+    Small businesses with fewer than 50 employees may apply for a temporary exemption.
+    """
+    
+    translation = """
+    Las nuevas regulaciones sobre emisiones de carbono entrarán en vigor el próximo trimestre.
+    Las empresas deben cumplir con estos estándares o enfrentar sanciones sustanciales.
+    Las pequeñas empresas con menos de 50 trabajadores pueden solicitar una excepción temporal.
+    """
+    
+    bad_translation = """
+    Las nuevas reglas sobre emisiones comenzarán pronto.
+    Empresas deben cumplir o pagar multas.
+    Negocios pequeños pueden pedir tiempo extra.
+    """
+    
+    console.print("\n[bold]1. Analyzing a single good translation...[/bold]")
+    # Analyze a single translation with alignment detection
+    results = analyze_translation_with_alignment(
+        source_text=source_text,
+        translation=translation,
+        use_groq=True,
+        detailed=True
+    )
+    
+    # Generate report
+    report = generate_alignment_report(results)
+    console.print(report)
+    
+    console.print("\n[bold]2. Comparing multiple translations (one good, one weak)...[/bold]")
+    # Compare multiple translations
+    comparison_results = compare_translations_with_alignment(
+        source_text=source_text,
+        translations=[translation, bad_translation],
+        use_groq=True
+    )
+    
+    # Print summary of comparison
+    console.print("\n[bold]TRANSLATION COMPARISON RESULTS:[/bold]")
+    console.print("=" * 50)
+    
+    if "ranked_translations" in comparison_results:
+        for i, trans in enumerate(comparison_results["ranked_translations"]):
+            console.print(f"Rank {i+1}: Composite Score {trans.get('quality_score', 0):.2f}")
+            if "metrics" in trans and "alignment_analysis" in trans["metrics"]:
+                alignment = trans["metrics"]["alignment_analysis"]
+                summary = alignment.get("enhanced_summary") or alignment.get("weak_alignment_summary", {})
+                
+                console.print(f"  Alignment: {summary.get('severity_level', 'N/A').upper()}")
+                console.print(f"  Main Finding: {summary.get('main_finding', 'N/A')}")
+            console.print("")
+    return 0
+
+def run_weight_demo(console):
+    """Runs a demo of using custom weights for analysis."""
+    console.print(Panel("[bold cyan]Running Custom Weights Analysis Demo[/bold cyan]"))
+
+    source_text = """
+    The new regulations on carbon emissions will take effect next quarter. 
+    Companies must comply with these standards or face substantial penalties.
+    Small businesses with fewer than 50 employees may apply for a temporary exemption.
+    """
+    
+    translation = """
+    Las nuevas regulaciones sobre emisiones de carbono entrarán en vigor el próximo trimestre.
+    Las empresas deben cumplir con estos estándares o enfrentar sanciones sustanciales.
+    Las pequeñas empresas con menos de 50 trabajadores pueden solicitar una excepción temporal.
+    """
+    
+    # Analyze with default weights
+    console.print("\n[bold]1. Analyzing with default weights...[/bold]")
+    default_results = analyze_translation_with_alignment(
+        source_text,
+        translation,
+        use_groq=True,
+        detailed=True
+    )
+    console.print(f"Composite Score (default weights): [bold green]{default_results.get('composite_score', 0):.4f}[/bold green]")
+    
+    # Define custom weights
+    custom_weights = {
+        "embedding_similarity": 0.8,      # Emphasize embedding similarity
+        "alignment_score": 0.1,           # De-emphasize alignment score
+        "groq_score": 0.1,                # De-emphasize Groq's simple score
+        "embedding_metrics_weight": 1.5,  # Boost the embedding metric group
+        "alignment_metrics_weight": 0.5,  # Lower the alignment metric group
+        "groq_simple_metrics_weight": 0.5 # Lower the Groq metric group
+    }
+    
+    console.print("\n[bold]2. Analyzing with custom weights...[/bold]")
+    console.print("[dim]Weights used:[/dim]")
+    for k, v in custom_weights.items():
+        console.print(f"[dim]  - {k}: {v}[/dim]")
+        
+    custom_results = analyze_translation_with_alignment(
+        source_text,
+        translation,
+        use_groq=True,
+        detailed=True,
+        custom_weights=custom_weights
+    )
+    console.print(f"Composite Score (custom weights): [bold yellow]{custom_results.get('composite_score', 0):.4f}[/bold yellow]")
+    
+    return 0
+
 def main():
     """Main entry point for the CLI tool."""
     # Set up argument parser
     parser = setup_argparser()
     args = parser.parse_args()
     
+    # Create console for rich output early
+    console = Console(color_system="auto" if args.color == "auto" else 
+                      (True if args.color == "always" else False))
+
+    if args.run_alignment_demo:
+        return run_alignment_demo(console)
+
+    if args.run_weight_demo:
+        return run_weight_demo(console)
+
     # Handle candidate-ranking shortcut early
     if getattr(args, 'rank_candidates', False):
         return rank_translations_cli(args)
@@ -500,10 +742,6 @@ def main():
         logging.getLogger('tqa').setLevel(logging.DEBUG)
     elif args.quiet:
         logging.getLogger('tqa').setLevel(logging.ERROR)
-    
-    # Create console for rich output
-    console = Console(color_system="auto" if args.color == "auto" else 
-                      (True if args.color == "always" else False))
     
     # Handle version display
     if args.version:
@@ -1180,69 +1418,102 @@ def main():
                     console.print(" ".join(cells))
     
     else:
-        # Default to standard translation quality analysis
-        # Use MultilingualModelManager for language-specific models
-        results = analyzer.analyze(
-            source_text,
-            target_text,
-            source_lang=args.source_lang,
-            target_lang=args.target_lang,
-            detailed=args.detailed_report
-        )
-        
-        # Display results
-        quality_score = results.quality_score * 100  # Convert to percentage
-        
-        # Color based on quality score
-        if quality_score >= 80:
-            color = "green"
-        elif quality_score >= 60:
-            color = "yellow"
+        if hasattr(args, 'weak_alignment') and args.weak_alignment:
+            # Perform composite analysis with optional weak alignment detection
+            use_groq_flag = (True if args.use_groq is None else args.use_groq)
+            results = analyze_translation_with_alignment(
+                source_text=source_text,
+                translation=target_text,
+                use_groq=use_groq_flag,
+                detailed=args.detailed_report,
+                segment_type=args.segment_type,
+                config_path=args.config
+            )
+            composite = results.get('composite_score', 0) * 100
+            # Colour based on composite score
+            if composite >= 80:
+                color = "green"
+            elif composite >= 60:
+                color = "yellow"
+            else:
+                color = "red"
+            panel_lines = [
+                f"[bold]Composite Quality Score:[/bold] [bold {color}]{composite:.1f}%[/bold {color}]"
+            ]
+            # If alignment summary available, show its headline
+            alignment = results.get('alignment_analysis', {})
+            summary = alignment.get('enhanced_summary') or alignment.get('weak_alignment_summary') or {}
+            if summary:
+                sev = summary.get('severity_level', 'n/a').upper()
+                finding = summary.get('main_finding', 'No summary')
+                panel_lines.append(f"[bold]Alignment Severity:[/bold] {sev}")
+                panel_lines.append(f"[bold]Key Finding:[/bold] {finding}")
+            panel = Panel("\n".join(panel_lines), title="Translation Quality & Alignment", border_style=color)
+            console.print(panel)
         else:
-            color = "red"
-        
-        panel = Panel(
-            f"[bold]Translation Quality Score:[/bold] [bold {color}]{quality_score:.1f}%[/bold {color}]\n"
-            f"Source language: {results.source_lang}\n"
-            f"Target language: {results.target_lang}\n"
-            f"Fluency score: {results.fluency_score*100:.1f}%\n"
-            f"Adequacy score: {results.accuracy_score*100:.1f}%",
-            title="Translation Quality Analysis",
-            border_style=color
-        )
-        
-        console.print(panel)
-        
-        # Show detailed report if requested
-        if args.detailed_report and hasattr(results, "segment_scores"):
-            # Create table for segment scores
-            table = Table(title="Segment Quality Scores")
-            table.add_column("Source", style="cyan", no_wrap=False)
-            table.add_column("Translation", style="green", no_wrap=False)
-            table.add_column("Quality", style="magenta")
+            # Default to standard translation quality analysis
+            # Use MultilingualModelManager for language-specific models
+            results = analyzer.analyze(
+                source_text,
+                target_text,
+                source_lang=args.source_lang,
+                target_lang=args.target_lang,
+                detailed=args.detailed_report
+            )
             
-            # Add rows for segments (limit to 10 if there are many)
-            segments = results.segment_scores
-            if len(segments) > 10 and not args.verbose:
-                console.print(f"[yellow]Showing 10 of {len(segments)} segments. Use --verbose to see all.[/yellow]")
-                segments = segments[:10]
+            # Display results
+            quality_score = results.quality_score * 100  # Convert to percentage
+            
+            # Color based on quality score
+            if quality_score >= 80:
+                color = "green"
+            elif quality_score >= 60:
+                color = "yellow"
+            else:
+                color = "red"
+            
+            panel = Panel(
+                f"[bold]Translation Quality Score:[/bold] [bold {color}]{quality_score:.1f}%[/bold {color}]\n"
+                f"Source language: {results.source_lang}\n"
+                f"Target language: {results.target_lang}\n"
+                f"Fluency score: {results.fluency_score*100:.1f}%\n"
+                f"Adequacy score: {results.accuracy_score*100:.1f}%",
+                title="Translation Quality Analysis",
+                border_style=color
+            )
+            
+            console.print(panel)
+            
+            # Show detailed report if requested
+            if args.detailed_report and hasattr(results, "segment_scores"):
+                # Create table for segment scores
+                table = Table(title="Segment Quality Scores")
+                table.add_column("Source", style="cyan", no_wrap=False)
+                table.add_column("Translation", style="green", no_wrap=False)
+                table.add_column("Quality", style="magenta")
                 
-            for segment in segments:
-                # Truncate very long segments for display
-                source = (segment.source[:80] + "...") if len(segment.source) > 80 else segment.source
-                target = (segment.target[:80] + "...") if len(segment.target) > 80 else segment.target
-                score = segment.score * 100
-                
-                # Color code based on score
-                score_color = "green" if score >= 80 else "yellow" if score >= 60 else "red"
-                
-                table.add_row(
-                    source,
-                    target,
-                    f"[{score_color}]{score:.1f}%[/{score_color}]"
-                )
-                
-            console.print(table)
+                # Add rows for segments (limit to 10 if there are many)
+                segments = results.segment_scores
+                if len(segments) > 10 and not args.verbose:
+                    console.print(f"[yellow]Showing 10 of {len(segments)} segments. Use --verbose to see all.[/yellow]")
+                    segments = segments[:10]
+                    
+                for segment in segments:
+                    # Truncate very long segments for display
+                    source = (segment.source[:80] + "...") if len(segment.source) > 80 else segment.source
+                    target = (segment.target[:80] + "...") if len(segment.target) > 80 else segment.target
+                    score = segment.score * 100
+                    
+                    # Color code based on score
+                    score_color = "green" if score >= 80 else "yellow" if score >= 60 else "red"
+                    
+                    table.add_row(
+                        source,
+                        target,
+                        f"[{score_color}]{score:.1f}%[/{score_color}]"
+                    )
+                    
+                console.print(table)
     
     return 0
 
