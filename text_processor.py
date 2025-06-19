@@ -400,3 +400,17 @@ class TextProcessor:
             'avg_word_length': avg_word_length,
             'language': language
         }
+
+    # ------------------------------------------------------------------
+    # Backwards-compatibility helpers
+    # ------------------------------------------------------------------
+
+    def normalize(self, text: str, language: str | None = None) -> str:  # pragma: no cover
+        """Alias kept for legacy code.
+
+        Older modules call ``text_processor.normalize``; internally we forward
+        to :py:meth:`normalize_text`. The *language* parameter is currently
+        ignored but retained for signature compatibility.
+        """
+        # If desired, language-specific rules could be applied here.
+        return self.normalize_text(text)

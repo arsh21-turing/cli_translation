@@ -27,3 +27,8 @@ pylint>=2.17.0
 
 pycountry
 fasttext
+
+tabulate>=0.8.0
+
+scikit-learn>=1.0.0
+pyyaml>=6.0.0
