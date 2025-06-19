@@ -26,6 +26,12 @@ from translation_ranker import (
 
 # Optional Groq integration
 try:
+    from groq_evaluator import GroqTranslationEvaluator  # type: ignore
+except ImportError:  # pragma: no cover
+    GroqTranslationEvaluator = None  # type: ignore
+
+# Fallback to legacy name
+try:
     from groq_evaluator import GroqEvaluator  # type: ignore
 except ImportError:  # pragma: no cover
     GroqEvaluator = None  # type: ignore
@@ -137,8 +143,25 @@ class TranslationQualityAnalyzer:
         else:
             self.config_manager = config_manager
             
-        # Initialize Groq evaluator if not provided
-        self.groq_evaluator = groq_evaluator
+        # Initialise Groq evaluator if not provided
+        if groq_evaluator is not None:
+            self.groq_evaluator = groq_evaluator
+        else:
+            # Prefer the modern class if available
+            if GroqTranslationEvaluator is not None:
+                try:
+                    from groq_client import GroqClient  # local import to avoid heavy deps on startup
+                    self.groq_evaluator = GroqTranslationEvaluator(client=GroqClient())  # type: ignore[arg-type]
+                except Exception:  # pragma: no cover – client may be unconfigured
+                    self.groq_evaluator = None
+            elif GroqEvaluator is not None:
+                try:
+                    from groq_client import GroqClient
+                    self.groq_evaluator = GroqEvaluator(client=GroqClient())  # type: ignore[arg-type]
+                except Exception:
+                    self.groq_evaluator = None
+            else:
+                self.groq_evaluator = None
         
     def analyze_pair(self, source_text, translation, use_groq=False, detailed=False, 
                     detect_weak_alignments=False, segment_type=None, custom_weights=None):
