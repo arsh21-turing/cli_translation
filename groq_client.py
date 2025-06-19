@@ -134,4 +134,95 @@ class GroqClient:
     @staticmethod
     def count_tokens(text: str) -> int:
         """Rudimentary token approximation – 1 token ~= 4 characters for English."""
-        return max(1, len(text) // 4) 
+        return max(1, len(text) // 4)
+
+    # ------------------------------------------------------------------
+    # Translation-specific helpers (new)
+    # ------------------------------------------------------------------
+
+    def evaluate_translation(
+        self,
+        source_text: str,
+        translated_text: str,
+        source_lang: str | None = None,
+        target_lang: str | None = None,
+        *,
+        model: Optional[str] = None,
+        temperature: float = 0.2,
+        json_mode: bool = True,
+    ) -> Dict[str, Any]:
+        """Ask Groq to rate *translated_text* vs *source_text*.
+
+        The response is returned verbatim from :py:meth:`generate_chat_completion` so
+        the caller can decide how to parse it (see :py:meth:`parse_response`).
+        """
+
+        if not source_text or not translated_text:
+            return {"error": "Missing source or translation text"}
+
+        lang_hint = (
+            f" Source language: {source_lang}; Target language: {target_lang}." if source_lang and target_lang else ""
+        )
+
+        system_prompt = (
+            "You are a professional bilingual translation reviewer.  Provide a concise, structured JSON assessment."
+        )
+
+        user_prompt = (
+            f"Source text: {source_text}\n\nTranslation: {translated_text}\n\n"
+            "Return a JSON object with keys: accuracy (0-10), fluency (0-10), terminology (0-10), style (0-10), "
+            "overall_score (0-10), summary, errors (array)." + lang_hint
+        )
+
+        return self.generate_chat_completion(
+            messages=[{"role": "system", "content": system_prompt}, {"role": "user", "content": user_prompt}],
+            model=model,
+            temperature=temperature,
+            max_tokens=1024,
+        )
+
+    # ------------------------------------------------------------------
+    def parse_response(self, response: Dict[str, Any]) -> Dict[str, Any]:
+        """Extract a JSON object from a Groq chat/completion response."""
+
+        if "error" in response:
+            return {"error": response["error"]}
+
+        # Chat completions store content under "content", classic completions under "text"
+        raw = response.get("content") or response.get("text", "")
+        if not raw:
+            return {"error": "Empty response", "raw_response": response}
+
+        import json as _json, re
+
+        # Try direct JSON parse first
+        try:
+            return _json.loads(raw)
+        except _json.JSONDecodeError:
+            pass
+
+        # Fallback: locate first JSON substring
+        match = re.search(r"\{.*\}", raw, re.S)
+        if match:
+            try:
+                return _json.loads(match.group(0))
+            except _json.JSONDecodeError:
+                pass
+
+        # Last resort: rudimentary extraction of scores
+        return self._extract_structured_data(raw)
+
+    # ------------------------------------------------------------------
+    def _extract_structured_data(self, content: str) -> Dict[str, Any]:
+        """Very simple heuristic parser for score lines like 'Accuracy: 8'."""
+        import re
+
+        scores: Dict[str, Any] = {}
+        for key in ["accuracy", "fluency", "terminology", "style", "overall"]:
+            pat = rf"{key}[\s:_-]*([0-9]+(?:\.[0-9]+)?)"
+            m = re.search(pat, content, re.I)
+            if m:
+                scores[f"{key}_score" if key != "overall" else "overall_score"] = float(m.group(1))
+        if not scores:
+            scores["raw_response"] = content
+        return scores 
