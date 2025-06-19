@@ -1,73 +1,1162 @@
 #!/usr/bin/env python3
 """
 Smart CLI Translation Quality Analyzer
-A command-line tool to analyze and evaluate translation quality.
+Main entry point for the command-line interface
 """
 
-import argparse
 import sys
 import os
+import argparse
+import logging
+import time
 from pathlib import Path
+from typing import List, Dict, Union, Optional, Any
+import textwrap
+from rich.console import Console
+from rich.panel import Panel
+from rich.table import Table
+from rich.syntax import Syntax
+from rich.box import Box
+from rich.progress import Progress
 
+# Import our components
 from config_manager import ConfigManager
+from model_loader import ModelLoader, ModelType, InferenceMode, MultilingualModelManager
+from text_processor import TextProcessor
+from embedding_generator import MultilingualEmbeddingGenerator
+from similarity_calculator import SimilarityCalculator
+from language_utils import LanguageDetector, EmbeddingBasedLanguageDetector, get_supported_languages
+from analyzer import TranslationQualityAnalyzer
 
-def main():
-    """Main entry point for the CLI application."""
-    # Load configuration
-    config = ConfigManager()
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.StreamHandler(),
+    ]
+)
+
+logger = logging.getLogger('tqa')
+
+def setup_argparser() -> argparse.ArgumentParser:
+    """
+    Set up the argument parser for the CLI.
     
+    Returns:
+        argparse.ArgumentParser: The configured argument parser
+    """
     parser = argparse.ArgumentParser(
-        description="Smart CLI Translation Quality Analyzer - Evaluate translation quality between languages"
+        description='Translation Quality Analyzer - Evaluate the quality of translations',
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter
     )
     
-    # Required arguments
-    parser.add_argument("--source", "-s", type=str, required=True, 
-                        help="Source text to analyze")
-    parser.add_argument("--translation", "-t", type=str, required=True, 
-                        help="Translated text to evaluate")
+    # Input options
+    input_group = parser.add_argument_group('Input Options')
+    input_group.add_argument(
+        '--source-file', '-sf', type=str,
+        help='Path to source text file'
+    )
+    input_group.add_argument(
+        '--target-file', '-tf', type=str,
+        help='Path to translated text file'
+    )
+    input_group.add_argument(
+        '--source-text', '-st', type=str,
+        help='Source text provided directly via command line'
+    )
+    input_group.add_argument(
+        '--target-text', '-tt', type=str,
+        help='Translated text provided directly via command line'
+    )
+    input_group.add_argument(
+        '--interactive', '-i', action='store_true',
+        help='Enter source and target text interactively'
+    )
     
-    # Optional arguments
-    parser.add_argument("--source-lang", type=str, 
-                        help="Source language code (auto-detect if not specified)")
-    parser.add_argument("--target-lang", type=str, 
-                        help="Target language code (auto-detect if not specified)")
-    parser.add_argument("--model", "-m", type=str,
-                        help=f"Embedding model to use (default: {config.get_model_path()})")
-    parser.add_argument("--verbose", "-v", action="store_true", 
-                        help="Enable verbose output")
-    parser.add_argument("--output", "-o", type=str, 
-                        help="Output path for analysis results (default: stdout)")
-    parser.add_argument("--config", "-c", type=str,
-                        help="Path to custom configuration file")
-    parser.add_argument("--set-api-key", type=str, nargs=2, metavar=("SERVICE", "KEY"),
-                        help="Set API key for specified service (groq or huggingface)")
+    # Translation operations
+    translation_group = parser.add_argument_group('Translation Operations')
+    translation_group.add_argument(
+        '--translate', action='store_true',
+        help='Translate source text to target language'
+    )
+    translation_group.add_argument(
+        '--rate-translation', action='store_true',
+        help='Rate the quality of a translation without analyzing it'
+    )
+    translation_group.add_argument(
+        '--translation-model', type=str,
+        help='Specify model to use for translation'
+    )
+    translation_group.add_argument(
+        '--translate-batch', action='store_true',
+        help='Process file as a batch of translations (one per line)'
+    )
+    translation_group.add_argument(
+        '--batch-output', type=str,
+        help='Output file for batch translation results'
+    )
     
+    # Language options
+    language_group = parser.add_argument_group('Language Options')
+    language_group.add_argument(
+        '--source-lang', type=str,
+        help='Source language code (ISO 639-1, e.g., "en", "fr", "zh")'
+    )
+    language_group.add_argument(
+        '--target-lang', type=str,
+        help='Target language code (ISO 639-1)'
+    )
+    language_group.add_argument(
+        '--list-languages', action='store_true',
+        help='List supported languages and exit'
+    )
+    language_group.add_argument(
+        '--detect-language', action='store_true',
+        help='Detect language of input text'
+    )
+    language_group.add_argument(
+        '--analyze-composition', action='store_true',
+        help='Analyze linguistic composition of text'
+    )
+    language_group.add_argument(
+        '--fast-detection', action='store_true',
+        help='Use faster but potentially less accurate language detection'
+    )
+    
+    # Analysis options
+    analysis_group = parser.add_argument_group('Analysis Options')
+    analysis_group.add_argument(
+        '--similarity', action='store_true',
+        help='Perform semantic similarity analysis'
+    )
+    analysis_group.add_argument(
+        '--metric', type=str,
+        choices=['cosine', 'euclidean', 'dot', 'manhattan', 'angular'],
+        default='cosine',
+        help='Similarity metric to use for comparison'
+    )
+    analysis_group.add_argument(
+        '--classify', action='store_true',
+        help='Include semantic match classification in results'
+    )
+    analysis_group.add_argument(
+        '--segmented', action='store_true',
+        help='Treat input texts as individual segments rather than documents'
+    )
+    analysis_group.add_argument(
+        '--cross-lingual', action='store_true',
+        help='Enable cross-lingual comparison mode'
+    )
+    analysis_group.add_argument(
+        '--similarity-threshold', type=float, default=0.75,
+        help='Threshold for considering texts similar (0.0-1.0)'
+    )
+    analysis_group.add_argument(
+        '--preprocessing', type=str,
+        choices=['minimal', 'standard', 'aggressive'], default='standard',
+        help='Level of text preprocessing to apply'
+    )
+    analysis_group.add_argument(
+        '--detailed-report', action='store_true',
+        help='Generate a detailed analysis report'
+    )
+    
+    # Configuration options
+    config_group = parser.add_argument_group('Configuration Options')
+    config_group.add_argument(
+        '--config', type=str,
+        help='Path to configuration file'
+    )
+    config_group.add_argument(
+        '--api-key', type=str,
+        help='API key for remote services'
+    )
+    config_group.add_argument(
+        '--cache-dir', type=str,
+        help='Directory for caching models and embeddings'
+    )
+    config_group.add_argument(
+        '--no-cache', action='store_true',
+        help='Disable caching of embeddings and models'
+    )
+    config_group.add_argument(
+        '--inference-mode', type=str,
+        choices=['local', 'api', 'hybrid'], default='local',
+        help='Mode for model inference (local, api, or hybrid)'
+    )
+    config_group.add_argument(
+        '--embedding-model', type=str,
+        help='Name or path of embedding model to use'
+    )
+    config_group.add_argument(
+        '--multilingual-model', type=str,
+        choices=['default', 'high_quality', 'efficient'],
+        help='Type of multilingual model to use'
+    )
+    
+    # Output options
+    output_group = parser.add_argument_group('Output Options')
+    output_group.add_argument(
+        '--output', '-o', type=str,
+        help='Output file for analysis results (default: stdout)'
+    )
+    output_group.add_argument(
+        '--format', type=str,
+        choices=['text', 'json', 'html', 'markdown'], default='text',
+        help='Output format'
+    )
+    output_group.add_argument(
+        '--verbose', '-v', action='store_true',
+        help='Enable verbose output'
+    )
+    output_group.add_argument(
+        '--quiet', '-q', action='store_true',
+        help='Suppress all non-error output'
+    )
+    output_group.add_argument(
+        '--color', type=str, choices=['auto', 'always', 'never'], default='auto',
+        help='Control colored output'
+    )
+    
+    # Misc options
+    misc_group = parser.add_argument_group('Miscellaneous')
+    misc_group.add_argument(
+        '--version', action='store_true',
+        help='Show version information and exit'
+    )
+    misc_group.add_argument(
+        '--debug', action='store_true',
+        help='Enable debug output'
+    )
+    misc_group.add_argument(
+        '--clear-cache', action='store_true',
+        help='Clear all cached data and exit'
+    )
+    
+    return parser
+
+def read_file_text(file_path: str) -> str:
+    """
+    Read text from a file, handling encoding issues.
+    
+    Args:
+        file_path: Path to the file
+        
+    Returns:
+        str: File contents
+        
+    Raises:
+        FileNotFoundError: If the file doesn't exist
+        UnicodeDecodeError: If the file can't be decoded
+    """
+    file_path = Path(file_path)
+    if not file_path.exists():
+        raise FileNotFoundError(f"File not found: {file_path}")
+        
+    # Try UTF-8 first (most common)
+    try:
+        with open(file_path, 'r', encoding='utf-8') as f:
+            return f.read()
+    except UnicodeDecodeError:
+        # Try other common encodings
+        for encoding in ['latin-1', 'cp1252', 'iso-8859-1']:
+            try:
+                with open(file_path, 'r', encoding=encoding) as f:
+                    return f.read()
+            except UnicodeDecodeError:
+                continue
+                
+        # If all else fails, try binary mode with errors='replace'
+        with open(file_path, 'r', encoding='utf-8', errors='replace') as f:
+            text = f.read()
+            logger.warning(f"File {file_path} contains characters that couldn't be decoded properly")
+            return text
+
+def get_interactive_input(prompt: str, multiline: bool = True) -> str:
+    """
+    Get text input from the user interactively.
+    
+    Args:
+        prompt: Text to display as prompt
+        multiline: Whether to allow multiline input
+        
+    Returns:
+        str: User input
+    """
+    console = Console()
+    console.print(f"\n[bold cyan]{prompt}[/bold cyan]")
+    
+    if multiline:
+        console.print("[dim](Enter text, then press CTRL+D (or CTRL+Z on Windows) to finish)[/dim]")
+        lines = []
+        try:
+            while True:
+                line = input()
+                lines.append(line)
+        except EOFError:
+            # User pressed CTRL+D (or CTRL+Z on Windows)
+            pass
+        return "\n".join(lines)
+    else:
+        return input()
+
+def show_version():
+    """Display version information."""
+    version = "1.0.0"  # Should be imported from package
+    console = Console()
+    console.print(Panel(
+        f"[bold]Translation Quality Analyzer[/bold] version {version}\n"
+        f"Python {sys.version}",
+        title="Version Information",
+        border_style="cyan"
+    ))
+
+def list_supported_languages():
+    """List supported languages."""
+    # Initialize minimal components to list languages
+    config = ConfigManager()
+    model_loader = ModelLoader(config)
+    
+    # Now properly initialize MultilingualModelManager
+    multilingual_manager = MultilingualModelManager(config, model_loader)
+    
+    # Get languages from the multilingual manager instead
+    langs = multilingual_manager.get_supported_languages()
+    console = Console()
+    
+    # Create a formatted table
+    table = Table(title="Supported Languages", box=Box.ROUNDED)
+    table.add_column("Code", style="cyan", no_wrap=True)
+    table.add_column("Language", style="green")
+    table.add_column("Family", style="yellow")
+    
+    # Add rows sorted alphabetically by language name
+    for lang in sorted(langs, key=lambda x: x['name']):
+        family = lang['family'] if lang['family'] else "Other"
+        table.add_row(lang['code'], lang['name'], family)
+    
+    console.print(table)
+
+def clear_all_cache(config: ConfigManager):
+    """Clear all cached data."""
+    console = Console()
+    
+    cache_dir = Path(os.path.expanduser(config.get("cache.directory", "~/.tqa/cache")))
+    models_dir = Path(os.path.expanduser(config.get("models.embedding.cache_dir", "~/.tqa/models")))
+    embedding_cache = Path(os.path.expanduser(config.get("models.embedding.cache_dir", "~/.tqa/embedding_cache")))
+    language_cache = Path(os.path.expanduser(config.get("language.cache_dir", "~/.tqa/language_cache")))
+    
+    with Progress() as progress:
+        task = progress.add_task("[cyan]Clearing cache...", total=4)
+        
+        # Clear cache directory
+        if cache_dir.exists():
+            for file in cache_dir.glob("*"):
+                try:
+                    if file.is_file():
+                        file.unlink()
+                    elif file.is_dir():
+                        import shutil
+                        shutil.rmtree(file)
+                except Exception as e:
+                    logger.error(f"Error clearing cache file {file}: {e}")
+        progress.update(task, advance=1)
+        
+        # Clear embedding cache
+        if embedding_cache.exists():
+            for file in embedding_cache.glob("*.npy"):
+                try:
+                    file.unlink()
+                except Exception as e:
+                    logger.error(f"Error clearing embedding cache file {file}: {e}")
+        progress.update(task, advance=1)
+        
+        # Clear language cache
+        if language_cache.exists():
+            for file in language_cache.glob("*"):
+                try:
+                    file.unlink()
+                except Exception as e:
+                    logger.error(f"Error clearing language cache file {file}: {e}")
+        progress.update(task, advance=1)
+        
+        # Note: We don't clear model files by default as they're large downloads
+        # Just inform the user
+        model_count = sum(1 for _ in models_dir.glob("*")) if models_dir.exists() else 0
+        progress.update(task, advance=1)
+    
+    console.print(f"[green]✓[/green] Cache directories cleared")
+    if model_count > 0:
+        console.print(f"[yellow]![/yellow] {model_count} model files remain in {models_dir}")
+        console.print(f"[dim]To clear models as well, manually delete: {models_dir}[/dim]")
+
+def write_to_file(file_path: str, content: str):
+    """Write content to a file."""
+    try:
+        with open(file_path, 'w', encoding='utf-8') as f:
+            f.write(content)
+        return True
+    except Exception as e:
+        logger.error(f"Error writing to file {file_path}: {e}")
+        return False
+
+def main():
+    """Main entry point for the CLI tool."""
+    # Set up argument parser
+    parser = setup_argparser()
     args = parser.parse_args()
     
-    # Handle config operations
-    if args.config:
-        config = ConfigManager(args.config)
+    # Configure logging level
+    if args.debug:
+        logging.getLogger('tqa').setLevel(logging.DEBUG)
+    elif args.quiet:
+        logging.getLogger('tqa').setLevel(logging.ERROR)
     
-    if args.set_api_key:
-        service, key = args.set_api_key
-        if service.lower() in ["groq", "huggingface"]:
-            config.set(f"api.{service.lower()}.api_key", key)
-            print(f"API key for {service} has been updated.")
-            sys.exit(0)
+    # Create console for rich output
+    console = Console(color_system="auto" if args.color == "auto" else 
+                      (True if args.color == "always" else False))
+    
+    # Handle version display
+    if args.version:
+        show_version()
+        return 0
+    
+    # Initialize configuration
+    config = ConfigManager(config_path=args.config)
+    
+    # Override config with command line options
+    if args.api_key:
+        config.set_api_key("default", args.api_key)
+    if args.cache_dir:
+        config.set("cache.directory", args.cache_dir)
+    if args.no_cache:
+        config.set("models.embedding.use_cache", False)
+    if args.inference_mode:
+        config.set("inference_mode", args.inference_mode)
+    if args.embedding_model:
+        config.set("models.embedding.default", args.embedding_model)
+    if args.multilingual_model:
+        config.set("models.multilingual.type", args.multilingual_model)
+    
+    # Handle cache clearing
+    if args.clear_cache:
+        clear_all_cache(config)
+        return 0
+    
+    # Initialize base components
+    model_loader = ModelLoader(
+        config=config,
+        inference_mode=args.inference_mode or config.get("inference_mode", "hybrid")
+    )
+    
+    # Initialize multilingual model manager
+    multilingual_model_manager = MultilingualModelManager(config, model_loader)
+    
+    # Initialize the text processor (required by the analyzer)
+    text_processor = TextProcessor()
+    
+    # Handle language listing - now uses MultilingualModelManager 
+    if args.list_languages:
+        # We've already defined a function for this
+        list_supported_languages()
+        return 0
+    
+    # Initialize the analyzer with all components explicitly
+    analyzer = TranslationQualityAnalyzer(
+        config=config,
+        model_loader=multilingual_model_manager,
+        text_processor=text_processor
+    )
+    
+    # Get input text
+    source_text = None
+    target_text = None
+    
+    # Interactive mode has the highest precedence
+    if args.interactive:
+        console.print(Panel(
+            "Enter the source text and translated text interactively.",
+            title="Interactive Mode",
+            border_style="cyan"
+        ))
+        
+        if args.translate:
+            # For translation, we only need source text and target language
+            source_text = get_interactive_input("Enter text to translate:")
+            if not args.target_lang:
+                args.target_lang = get_interactive_input("Enter target language code (e.g., es for Spanish):", multiline=False)
         else:
-            print(f"Unknown service: {service}. Supported services: groq, huggingface")
-            sys.exit(1)
+            source_text = get_interactive_input("Enter source text:")
+            if args.rate_translation:
+                # For rating, we need both texts
+                target_text = get_interactive_input("Enter translated text:")
+            elif not args.translate:
+                # Default mode needs both texts
+                target_text = get_interactive_input("Enter translated text:")
+    else:
+        # Command-line text has precedence over files
+        if args.source_text:
+            source_text = args.source_text
+        elif args.source_file:
+            try:
+                source_text = read_file_text(args.source_file)
+            except Exception as e:
+                console.print(f"[bold red]Error reading source file:[/bold red] {e}")
+                return 1
+        
+        if args.target_text:
+            target_text = args.target_text
+        elif args.target_file:
+            try:
+                target_text = read_file_text(args.target_file)
+            except Exception as e:
+                console.print(f"[bold red]Error reading target file:[/bold red] {e}")
+                return 1
     
-    # Basic validation
-    if not args.source or not args.translation:
+    # Handle translation
+    if args.translate:
+        # Check if we have source text
+        if not source_text:
+            console.print("[bold red]Error:[/bold red] Source text is required for translation.")
+            console.print("[dim]Use --source-text or --source-file to provide input.[/dim]")
+            return 1
+            
+        # Check if we have target language
+        if not args.target_lang:
+            console.print("[bold red]Error:[/bold red] Target language is required for translation.")
+            console.print("[dim]Use --target-lang to specify the language to translate into.[/dim]")
+            return 1
+            
+        # Auto-detect source language if not provided
+        if not args.source_lang:
+            detection_result = analyzer.detect_language_advanced(source_text)
+            if isinstance(detection_result, dict):
+                args.source_lang = detection_result['language']
+                console.print(f"[yellow]Auto-detected source language:[/yellow] {args.source_lang}")
+            else:
+                args.source_lang = detection_result
+                console.print(f"[yellow]Auto-detected source language:[/yellow] {args.source_lang}")
+        
+        # Show translation status
+        console.print(Panel(
+            f"Translating from {args.source_lang} to {args.target_lang}...",
+            title="Translation In Progress",
+            border_style="yellow"
+        ))
+        
+        # Handle batch translation
+        if args.translate_batch:
+            # Split into lines and translate each
+            lines = source_text.strip().split('\n')
+            translations = []
+            
+            with Progress() as progress:
+                task = progress.add_task("[cyan]Translating...", total=len(lines))
+                
+                for line in lines:
+                    if line.strip():
+                        # Use the multilingual model manager to get the appropriate model
+                        translation = analyzer.translate_text(
+                            line.strip(),
+                            source_lang=args.source_lang,
+                            target_lang=args.target_lang,
+                            model_name=args.translation_model
+                        )
+                        translations.append(translation)
+                    else:
+                        translations.append("")
+                    progress.update(task, advance=1)
+            
+            # Join translations
+            result = "\n".join(translations)
+            
+            # Save to file if requested
+            if args.batch_output:
+                if write_to_file(args.batch_output, result):
+                    console.print(f"[green]Translations saved to:[/green] {args.batch_output}")
+                else:
+                    console.print(f"[red]Failed to save translations to:[/red] {args.batch_output}")
+            
+            # Display first few translations
+            table = Table(title=f"Batch Translation Results ({len(lines)} lines)")
+            table.add_column("Source", style="cyan", no_wrap=False)
+            table.add_column("Translation", style="green", no_wrap=False)
+            
+            # Show at most 5 examples
+            for i, (src, tgt) in enumerate(zip(lines[:5], translations[:5])):
+                # Truncate very long segments
+                src_display = (src[:80] + "...") if len(src) > 80 else src
+                tgt_display = (tgt[:80] + "...") if len(tgt) > 80 else tgt
+                table.add_row(src_display, tgt_display)
+                
+            console.print(table)
+            
+            if len(lines) > 5:
+                console.print(f"[dim]...and {len(lines) - 5} more lines[/dim]")
+        else:
+            # Single translation - use multilingual model manager to get the appropriate model
+            translation = analyzer.translate_text(
+                source_text,
+                source_lang=args.source_lang,
+                target_lang=args.target_lang,
+                model_name=args.translation_model
+            )
+            
+            # Display translation
+            panel = Panel(
+                translation,
+                title=f"Translation from {args.source_lang} to {args.target_lang}",
+                border_style="green"
+            )
+            console.print(panel)
+            
+            # Save to file if requested
+            if args.output:
+                if write_to_file(args.output, translation):
+                    console.print(f"[green]Translation saved to:[/green] {args.output}")
+                else:
+                    console.print(f"[red]Failed to save translation to:[/red] {args.output}")
+            
+            # Set as target text for possible rating
+            target_text = translation
+        
+        # After translation, if rate-translation is also specified, continue to rating
+        if not args.rate_translation:
+            return 0
+    
+    # Handle language detection
+    if args.detect_language:
+        # Check if we have input text
+        if not source_text and not args.source_text and not args.source_file:
+            # Prompt for text if none provided
+            source_text = get_interactive_input("Enter text to detect language:")
+        
+        # Use source text for language detection if we have it
+        text_to_analyze = source_text if source_text else ""
+        
+        # Perform language detection
+        detection_result = analyzer.detect_language_advanced(
+            text_to_analyze,
+            fast_mode=args.fast_detection,
+            detailed=args.verbose
+        )
+        
+        # Create rich console for output
+        if isinstance(detection_result, dict):
+            # Detailed result
+            lang_code = detection_result['language']
+            confidence = detection_result['confidence'] * 100  # Convert to percentage
+            lang_name = detection_result.get('language_name', 'Unknown')
+            
+            # Color based on confidence
+            if confidence >= 85:
+                conf_color = "green"
+            elif confidence >= 60:
+                conf_color = "yellow"
+            else:
+                conf_color = "red"
+            
+            # Basic panel with language info
+            panel_content = [
+                f"[bold]Detected Language:[/bold] {lang_name} ({lang_code})",
+                f"[bold]Confidence:[/bold] [{conf_color}]{confidence:.1f}%[/{conf_color}]",
+                f"[bold]Detection Method:[/bold] {detection_result['method'].capitalize()}"
+            ]
+            
+            # Add multilingual info if available
+            if detection_result.get('is_multilingual'):
+                panel_content.append("\n[bold]Multilingual Content Detected[/bold]")
+                
+                # Add composition details
+                if 'language_composition' in detection_result:
+                    composition = detection_result['language_composition']
+                    top_languages = sorted(composition.items(), key=lambda x: x[1], reverse=True)[:3]
+                    
+                    panel_content.append("[bold]Language Composition:[/bold]")
+                    for lang, percentage in top_languages:
+                        try:
+                            import pycountry
+                            lang_obj = pycountry.languages.get(alpha_2=lang)
+                            lang_name = lang_obj.name if lang_obj else lang
+                        except (AttributeError, KeyError, ImportError):
+                            lang_name = lang
+                            
+                        panel_content.append(f"  {lang_name}: {percentage*100:.1f}%")
+            
+            # Create and display the panel
+            panel = Panel(
+                "\n".join(panel_content),
+                title="Language Detection Results",
+                border_style=conf_color
+            )
+            console.print(panel)
+            
+            # Show detailed script information for verbose mode
+            if args.verbose and 'scripts' in detection_result:
+                scripts = detection_result['scripts']
+                
+                if scripts:
+                    # Create a table for scripts
+                    table = Table(title="Script Composition")
+                    table.add_column("Script", style="cyan")
+                    table.add_column("Proportion", style="magenta")
+                    
+                    # Add rows for each script (sorted by proportion)
+                    for script, prop in sorted(scripts.items(), key=lambda x: x[1], reverse=True):
+                        if prop > 0.01:  # Only show scripts with at least 1%
+                            table.add_row(
+                                script,
+                                f"{prop*100:.1f}%"
+                            )
+                    
+                    console.print(table)
+            
+            # Show all candidate languages for verbose mode
+            if args.verbose and 'all_scores' in detection_result:
+                scores = detection_result['all_scores']
+                
+                if len(scores) > 1:
+                    # Create a table for candidate languages
+                    table = Table(title="Language Candidates")
+                    table.add_column("Language", style="cyan")
+                    table.add_column("Score", style="magenta")
+                    
+                    # Add rows for each language (sorted by score)
+                    top_langs = sorted(scores.items(), key=lambda x: x[1], reverse=True)[:5]
+                    for lang, score in top_langs:
+                        try:
+                            import pycountry
+                            lang_obj = pycountry.languages.get(alpha_2=lang)
+                            lang_name = lang_obj.name if lang_obj else lang
+                        except (AttributeError, KeyError, ImportError):
+                            lang_name = lang
+                            
+                        table.add_row(
+                            f"{lang_name} ({lang})",
+                            f"{score*100:.1f}%"
+                        )
+                    
+                    console.print(table)
+        else:
+            # Simple result (just language code)
+            try:
+                import pycountry
+                lang_obj = pycountry.languages.get(alpha_2=detection_result)
+                lang_name = lang_obj.name if lang_obj else "Unknown"
+            except (AttributeError, KeyError, ImportError):
+                lang_name = "Unknown"
+                
+            console.print(f"Detected language: {lang_name} ({detection_result})")
+        
+        return 0
+        
+    # Handle text composition analysis
+    elif args.analyze_composition:
+        # Check if we have input text
+        if not source_text and not args.source_text and not args.source_file:
+            # Prompt for text if none provided
+            source_text = get_interactive_input("Enter text to analyze composition:")
+        
+        # Use source text for composition analysis
+        text_to_analyze = source_text if source_text else ""
+        
+        # Perform composition analysis
+        analysis = analyzer.analyze_text_composition(text_to_analyze)
+        
+        # Display main results
+        panel_content = [
+            f"[bold]Primary Language:[/bold] {analysis['primary_language']}",
+            f"[bold]Number of Languages:[/bold] {analysis['language_count']}",
+            f"[bold]Is Multilingual:[/bold] {'Yes' if analysis['is_multilingual'] else 'No'}"
+        ]
+        
+        panel = Panel(
+            "\n".join(panel_content),
+            title="Text Composition Analysis",
+            border_style="cyan"
+        )
+        console.print(panel)
+        
+        # Display language composition
+        if analysis['composition']:
+            # Create table for language composition
+            table = Table(title="Language Composition")
+            table.add_column("Language", style="cyan")
+            table.add_column("Percentage", style="magenta")
+            
+            # Add rows for each language
+            for lang, percentage in sorted(
+                analysis['composition'].items(), key=lambda x: x[1], reverse=True
+            ):
+                try:
+                    import pycountry
+                    lang_obj = pycountry.languages.get(alpha_2=lang)
+                    lang_name = lang_obj.name if lang_obj else lang
+                except (AttributeError, KeyError, ImportError):
+                    lang_name = lang
+                    
+                table.add_row(
+                    f"{lang_name} ({lang})",
+                    f"{percentage*100:.1f}%"
+                )
+            
+            console.print(table)
+            
+        # Display segments for verbose mode
+        if args.verbose and analysis['segments']:
+            console.print("\n[bold]Text Segments by Language:[/bold]\n")
+            
+            for i, segment in enumerate(analysis['segments']):
+                lang = segment['language']
+                try:
+                    import pycountry
+                    lang_obj = pycountry.languages.get(alpha_2=lang)
+                    lang_name = f"{lang_obj.name} ({lang})" if lang_obj else lang
+                except (AttributeError, KeyError, ImportError):
+                    lang_name = lang
+                    
+                # Color based on confidence
+                confidence = segment['confidence'] * 100
+                if confidence >= 85:
+                    color = "green"
+                elif confidence >= 60:
+                    color = "yellow"
+                else:
+                    color = "red"
+                    
+                # Display segment with its language
+                console.print(f"[{color}]Segment {i+1} - {lang_name} ({confidence:.1f}%):[/{color}]")
+                # Limit segment display to avoid overwhelming the console
+                text = segment['text']
+                if len(text) > 100:
+                    text = text[:97] + "..."
+                console.print(text)
+                console.print("")  # Empty line
+                
+        return 0
+    
+    # Handle translation rating
+    if args.rate_translation:
+        # Check if we have both texts
+        if not source_text or not target_text:
+            console.print("[bold red]Error:[/bold red] Both source and target texts are required for rating.")
+            return 1
+            
+        # Auto-detect languages if not provided
+        if not args.source_lang:
+            detection = analyzer.detect_language_advanced(source_text)
+            if isinstance(detection, dict):
+                args.source_lang = detection['language']
+            else:
+                args.source_lang = detection
+            console.print(f"[yellow]Auto-detected source language:[/yellow] {args.source_lang}")
+            
+        if not args.target_lang:
+            detection = analyzer.detect_language_advanced(target_text)
+            if isinstance(detection, dict):
+                args.target_lang = detection['language']
+            else:
+                args.target_lang = detection
+            console.print(f"[yellow]Auto-detected target language:[/yellow] {args.target_lang}")
+        
+        # Rate the translation
+        console.print(Panel(
+            f"Rating translation quality from {args.source_lang} to {args.target_lang}...",
+            title="Translation Rating",
+            border_style="yellow"
+        ))
+        
+        # Perform quick rating
+        # Use multilingual_model_manager for language-specific models
+        rating = analyzer.analyze(
+            source_text,
+            target_text,
+            source_lang=args.source_lang,
+            target_lang=args.target_lang
+        )
+        
+        # Display rating results
+        score = rating.quality_score * 100  # Convert to percentage
+        
+        # Color based on score
+        if score >= 80:
+            color = "green"
+        elif score >= 60:
+            color = "yellow"
+        else:
+            color = "red"
+            
+        # Create rating panel
+        panel_content = [
+            f"[bold]Overall Rating:[/bold] [bold {color}]{score:.1f}%[/bold {color}]",
+        ]
+        
+        # Add subscores if available
+        if rating.fluency_score:
+            fluency = rating.fluency_score * 100
+            fluency_color = "green" if fluency >= 80 else "yellow" if fluency >= 60 else "red"
+            panel_content.append(f"[bold]Fluency:[/bold] [{fluency_color}]{fluency:.1f}%[/{fluency_color}]")
+            
+        if rating.accuracy_score:
+            accuracy = rating.accuracy_score * 100
+            accuracy_color = "green" if accuracy >= 80 else "yellow" if accuracy >= 60 else "red"
+            panel_content.append(f"[bold]Accuracy:[/bold] [{accuracy_color}]{accuracy:.1f}%[/{accuracy_color}]")
+            
+        if rating.detailed_feedback:
+            panel_content.append(f"\n[bold]Feedback:[/bold] {rating.detailed_feedback}")
+        
+        panel = Panel(
+            "\n".join(panel_content),
+            title="Translation Rating Results",
+            border_style=color
+        )
+        
+        console.print(panel)
+        
+        return 0
+    
+    # Check if we have required input for analysis
+    if not source_text or not target_text:
+        # If either text is missing and we're not in a special mode, show error
+        if source_text and not target_text:
+            console.print("[bold yellow]Warning:[/bold yellow] Target text is missing. Please provide translated text.")
+        elif not source_text and target_text:
+            console.print("[bold yellow]Warning:[/bold yellow] Source text is missing. Please provide source text.")
+        else:
+            # Both missing, but we might be in a special mode
+            if not args.detect_language and not args.analyze_composition:
+                console.print("[bold red]Error:[/bold red] Both source and target texts are required.")
+                console.print("[dim]Use --source-text/--target-text or --source-file/--target-file to provide input.[/dim]")
+                console.print("[dim]Or use --interactive for guided input.[/dim]")
+        
+        # Show command line help
+        console.print("\n[bold cyan]Command-line arguments:[/bold cyan]")
         parser.print_help()
-        sys.exit(1)
+        return 1
     
-    # Will add actual analysis functionality in the future
-    print("Source text:", args.source)
-    print("Translation:", args.translation)
-    print("Analysis functionality will be implemented in future updates.")
-    print(f"Using configuration from: {config.config_path}")
+    # Perform analysis based on selected mode
+    if args.similarity:
+        # Perform semantic similarity analysis
+        # Use MultilingualModelManager for language-specific models
+        results = analyzer.analyze_semantic_similarity(
+            source_text,
+            target_text,
+            metric=args.metric,
+            source_lang=args.source_lang,
+            target_lang=args.target_lang,
+            segmented=args.segmented,
+            classification=args.classify
+        )
+        
+        # Overall similarity panel
+        avg_similarity = results["average_similarity"] * 100
+        source_lang = results["source_language"]
+        target_lang = results["target_language"]
+        
+        # Color code based on similarity
+        if avg_similarity >= 80:
+            color = "green"
+        elif avg_similarity >= 60:
+            color = "yellow"
+        else:
+            color = "red"
+        
+        # Include classification if requested
+        classification_info = ""
+        if args.classify and "overall_match_class" in results:
+            match_class = results["overall_match_class"]
+            classification_info = f"\nMatch class: [bold]{match_class.upper()}[/bold]"
+        
+        panel = Panel(
+            f"[bold]Semantic Similarity:[/bold] [bold {color}]{avg_similarity:.1f}%[/bold {color}]\n"
+            f"Source language: {source_lang}\n"
+            f"Target language: {target_lang}\n"
+            f"Metric: {results['metric']}"
+            f"{classification_info}",
+            title="Similarity Analysis Results",
+            border_style=color
+        )
+        
+        console.print(panel)
+        
+        # Display segment analysis if verbose or multi-segment
+        if (args.verbose or len(results["segment_analysis"]) > 1) and not args.segmented:
+            # Create table for segment comparison
+            table = Table(title="Segment-by-Segment Comparison", box=Box.ROUNDED)
+            table.add_column("Source", style="cyan", no_wrap=False)
+            table.add_column("Target", style="green", no_wrap=False)
+            table.add_column("Similarity", style="magenta")
+            
+            if args.classify:
+                table.add_column("Match", style="yellow")
+                
+            # Add rows for segments (limit to top 10 if there are many)
+            segments_to_show = results["segment_analysis"]
+            if len(segments_to_show) > 10 and not args.verbose:
+                console.print(f"[yellow]Showing 10 of {len(segments_to_show)} segments. Use --verbose to see all.[/yellow]")
+                segments_to_show = segments_to_show[:10]
+                
+            for segment in segments_to_show:
+                # Truncate very long segments for display
+                source_display = (segment["source"][:80] + "...") if len(segment["source"]) > 80 else segment["source"]
+                target_display = (segment["target"][:80] + "...") if len(segment["target"]) > 80 else segment["target"]
+                
+                sim_value = segment["similarity"] * 100
+                sim_color = "green" if sim_value >= 80 else "yellow" if sim_value >= 60 else "red"
+                similarity_cell = f"[{sim_color}]{sim_value:.1f}%[/{sim_color}]"
+                
+                if args.classify and "match_class" in segment:
+                    table.add_row(
+                        source_display, 
+                        target_display,
+                        similarity_cell,
+                        segment["match_class"].upper()
+                    )
+                else:
+                    table.add_row(
+                        source_display, 
+                        target_display,
+                        similarity_cell
+                    )
+            
+            console.print(table)
+            
+        # Display performance info
+        if "analysis_time" in results:
+            console.print(f"[dim]Analysis completed in {results['analysis_time']:.2f} seconds[/dim]")
+    
+    elif args.cross_lingual:
+        # Perform cross-lingual analysis
+        # Use MultilingualModelManager for language-specific models
+        results = analyzer.analyze_cross_lingual_similarity(
+            source_text,
+            target_text,
+            source_lang=args.source_lang,
+            target_lang=args.target_lang,
+            similarity_metric=args.metric,
+            preprocessing_level=args.preprocessing,
+            detailed=args.verbose
+        )
+        
+        # Basic results panel
+        avg_similarity = results["average_similarity"] * 100
+        source_lang = results["source_language"]
+        target_lang = results["target_language"]
+        
+        # Color code based on similarity
+        if avg_similarity >= 80:
+            color = "green"
+        elif avg_similarity >= 60:
+            color = "yellow"
+        else:
+            color = "red"
+        
+        panel = Panel(
+            f"[bold]Cross-lingual Similarity:[/bold] [bold {color}]{avg_similarity:.1f}%[/bold {color}]\n"
+            f"Source language: {source_lang}\n"
+            f"Target language: {target_lang}\n"
+            f"Metric: {results['metric']}",
+            title="Translation Analysis Results",
+            border_style=color
+        )
+        
+        console.print(panel)
+        
+        # Detailed results if verbose
+        if args.verbose and "alignment_confidence" in results:
+            confidence = results["alignment_confidence"] * 100
+            
+            detail_panel = Panel(
+                f"[bold]Alignment confidence:[/bold] {confidence:.1f}%\n"
+                f"Number of mutual best matches: {len(results['mutual_best_matches'])}\n"
+                f"Total segments analyzed: {len(results['similarity_scores'])}",
+                title="Detailed Analysis",
+                border_style="cyan"
+            )
+            
+            console.print(detail_panel)
+            
+            # Display a heatmap visualization of the similarity matrix if not too large
+            if len(results["similarity_scores"]) <= 20 and "similarity_matrix" in results:
+                console.print("[bold]Similarity Matrix:[/bold]")
+                matrix = results["similarity_matrix"]
+                
+                # Create a simple ASCII heatmap
+                for row in matrix:
+                    cells = []
+                    for val in row:
+                        # Convert similarity to a color intensity
+                        intensity = min(int(val * 9), 8)  # 0-8 scale
+                        cells.append(f"[color(231)][[/color(231)][color({232+intensity*3})]{'█' * intensity}[/color({232+intensity*3})][color(231)]][/color(231)]")
+                    console.print(" ".join(cells))
+    
+    else:
+        # Default to standard translation quality analysis
+        # Use MultilingualModelManager for language-specific models
+        results = analyzer.analyze(
+            source_text,
+            target_text,
+            source_lang=args.source_lang,
+            target_lang=args.target_lang,
+            detailed=args.detailed_report
+        )
+        
+        # Display results
+        quality_score = results.quality_score * 100  # Convert to percentage
+        
+        # Color based on quality score
+        if quality_score >= 80:
+            color = "green"
+        elif quality_score >= 60:
+            color = "yellow"
+        else:
+            color = "red"
+        
+        panel = Panel(
+            f"[bold]Translation Quality Score:[/bold] [bold {color}]{quality_score:.1f}%[/bold {color}]\n"
+            f"Source language: {results.source_lang}\n"
+            f"Target language: {results.target_lang}\n"
+            f"Fluency score: {results.fluency_score*100:.1f}%\n"
+            f"Adequacy score: {results.accuracy_score*100:.1f}%",
+            title="Translation Quality Analysis",
+            border_style=color
+        )
+        
+        console.print(panel)
+        
+        # Show detailed report if requested
+        if args.detailed_report and hasattr(results, "segment_scores"):
+            # Create table for segment scores
+            table = Table(title="Segment Quality Scores")
+            table.add_column("Source", style="cyan", no_wrap=False)
+            table.add_column("Translation", style="green", no_wrap=False)
+            table.add_column("Quality", style="magenta")
+            
+            # Add rows for segments (limit to 10 if there are many)
+            segments = results.segment_scores
+            if len(segments) > 10 and not args.verbose:
+                console.print(f"[yellow]Showing 10 of {len(segments)} segments. Use --verbose to see all.[/yellow]")
+                segments = segments[:10]
+                
+            for segment in segments:
+                # Truncate very long segments for display
+                source = (segment.source[:80] + "...") if len(segment.source) > 80 else segment.source
+                target = (segment.target[:80] + "...") if len(segment.target) > 80 else segment.target
+                score = segment.score * 100
+                
+                # Color code based on score
+                score_color = "green" if score >= 80 else "yellow" if score >= 60 else "red"
+                
+                table.add_row(
+                    source,
+                    target,
+                    f"[{score_color}]{score:.1f}%[/{score_color}]"
+                )
+                
+            console.print(table)
+    
+    return 0
 
 if __name__ == "__main__":
-    main() 
+    sys.exit(main())
