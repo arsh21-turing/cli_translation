@@ -524,13 +524,21 @@ class TranslationQualityAnalyzer:
         total_weight = 0
         
         # Process each component group
+        group_weight_mapping = {
+            "embedding": "embedding_metrics_weight",
+            "alignment": "alignment_metrics_weight", 
+            "groq_simple": "groq_simple_metrics_weight",
+            "groq_detailed": "groq_detailed_metrics_weight"
+        }
+        
         for group, data in components.items():
             if data["weight"] > 0:
                 # Calculate group score
                 group_score = data["score"] / data["weight"]
                 
-                # Apply group weight
-                group_weight = weights[f"{group}_weight"]
+                # Apply group weight using correct mapping
+                group_weight_key = group_weight_mapping.get(group, f"{group}_weight")
+                group_weight = weights.get(group_weight_key, 0.5)  # Default weight if not found
                 
                 final_score += group_score * group_weight
                 total_weight += group_weight

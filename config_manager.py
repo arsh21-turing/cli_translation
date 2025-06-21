@@ -151,48 +151,76 @@ class ConfigManager:
     
     def get(self, key_path: str, default: Any = None) -> Any:
         """
-        Get configuration value using dot notation path.
+        Get configuration value using dot notation path. Environment variables
+        prefixed with ``CONFIG_`` take precedence over values stored in the
+        configuration file.
         
-        Args:
-            key_path: Dot-separated path to config value (e.g., 'api.groq.endpoint')
-            default: Default value if key doesn't exist
-            
-        Returns:
-            Configuration value or default if not found
+        For example, requesting ``batch.size`` will first look for an
+        environment variable named ``CONFIG_BATCH_SIZE`` (upper-cased and dots
+        replaced with underscores). If found, the string value is converted to
+        int/float/bool if possible before being returned.
         """
         keys = key_path.split('.')
-        value = self.config
-        
+
+        # ----------------------------------------------------------------------------
+        # 1) Environment variable override
+        # ----------------------------------------------------------------------------
+        env_var = 'CONFIG_' + '_'.join(keys).upper()
+        env_val = os.environ.get(env_var)
+        if env_val is not None:
+            # Attempt rudimentary type casting – int, float, bool, json, fallback str
+            lowered = env_val.lower()
+            if lowered in {'true', 'false'}:
+                return lowered == 'true'
+            try:
+                return int(env_val)
+            except ValueError:
+                pass
+            try:
+                return float(env_val)
+            except ValueError:
+                pass
+            try:
+                return json.loads(env_val)
+            except Exception:
+                return env_val  # raw string
+
+        # ----------------------------------------------------------------------------
+        # 2) Regular config lookup
+        # ----------------------------------------------------------------------------
+        value: Any = self.config
         for key in keys:
             if isinstance(value, dict) and key in value:
                 value = value[key]
             else:
                 return default
-                
         return value
     
     def set(self, key_path: str, value: Any, save: bool = True) -> None:
         """
-        Set configuration value using dot notation path.
-        
-        Args:
-            key_path: Dot-separated path to config value (e.g., 'api.groq.api_key')
-            value: Value to set
-            save: Whether to save config to file after update
+        Enhanced setter that prevents structural conflicts (i.e. attempting to
+        assign into a scalar value). If such a conflict is detected a
+        ``ValueError`` is raised, matching unit-test expectations.
         """
         keys = key_path.split('.')
         config_section = self.config
-        
-        # Navigate to the appropriate nested dictionary
+
+        # Navigate through all but last key, creating nested dicts as required.
         for key in keys[:-1]:
-            if key not in config_section:
+            current_val = config_section.get(key)
+            if current_val is None:
                 config_section[key] = {}
-            config_section = config_section[key]
-        
-        # Set the value
+                current_val = config_section[key]
+            # If we encounter a non-dict value before reaching our destination
+            # it means the path conflicts with an existing scalar (e.g.
+            # "a.b" already set to int and now we try to set "a.b.c").
+            if not isinstance(current_val, dict):
+                raise ValueError(f"Cannot create sub-key under non-mapping path '{'.'.join(keys[:-1])}'")
+            config_section = current_val
+
+        # Finally set the value (no conflict at this point)
         config_section[keys[-1]] = value
-        
-        # Save if requested
+
         if save:
             self.save_config()
     
@@ -364,4 +392,56 @@ class ConfigManager:
             setting_name: Name of the setting
             value: Setting value to set
         """
-        self.set(f'alignment.{setting_name}', value) 
+        self.set(f'alignment.{setting_name}', value)
+
+    # ---------------------------------------------------------------------
+    # Convenience / helper special methods
+    # ---------------------------------------------------------------------
+    def __iter__(self):
+        """Iterate over top-level configuration section names."""
+        return iter(self.config.keys())
+
+    def __contains__(self, item):
+        """True if *item* is a top-level section present in the config."""
+        return item in self.config
+
+    _SENSITIVE_PATTERNS = {"password", "secret", "token", "api_key", "api_keys"}
+
+    def __str__(self) -> str:  # pragma: no cover
+        """Return a JSON representation with sensitive values masked."""
+        def mask(obj):
+            if isinstance(obj, dict):
+                masked = {}
+                for k, v in obj.items():
+                    if any(p in k.lower() for p in self._SENSITIVE_PATTERNS):
+                        masked[k] = "***"
+                    else:
+                        masked[k] = mask(v)
+                return masked
+            if isinstance(obj, list):
+                return [mask(x) for x in obj]
+            return obj
+
+        try:
+            return json.dumps(mask(self.config), indent=2, ensure_ascii=False)
+        except Exception:
+            return str(mask(self.config))
+
+    # ---------------------------------------------------------------------
+    # Advanced helpers utilised by the extended test-suite
+    # ---------------------------------------------------------------------
+    def merge_with_defaults(self, defaults: Dict[str, Any]):
+        """Return a *new* ConfigManager instance representing *self* merged with
+        the provided *defaults* mapping. Values in *self* take precedence over
+        *defaults* (i.e. behave like overlay config). The returned object is
+        entirely independent – further modifications will **not** affect the
+        original instance.
+        """
+        from copy import deepcopy
+
+        merged_cfg = ConfigManager()
+        # Avoid disk IO for the new instance – use in-memory path outside ~/.tqa
+        merged_cfg.config_path = Path(os.devnull)
+        merged_cfg.config = deepcopy(self.config)
+        self._deep_update(merged_cfg.config, deepcopy(defaults))
+        return merged_cfg 
