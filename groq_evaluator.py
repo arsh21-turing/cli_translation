@@ -403,4 +403,19 @@ class GroqEvaluator:
             return {"overall_score": 0.0, "raw_response": content}
         except json.JSONDecodeError as exc:
             logger.error("JSON decode error: %s", exc)
-            return {"overall_score": 0.0, "raw_response": content} 
+            return {"overall_score": 0.0, "raw_response": content}
+
+# -----------------------------------------------------------------------------
+# Thin wrapper – preferred modern name
+# -----------------------------------------------------------------------------
+
+
+class GroqTranslationEvaluator(GroqEvaluator):
+    """Alias for :class:`GroqEvaluator` providing forward-compatible import path.
+
+    The implementation is identical; keeping a distinct class name simplifies
+    migrations without touching existing logic.  Extend here in the future if
+    behaviour needs to diverge.
+    """
+
+    pass 

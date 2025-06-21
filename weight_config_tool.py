@@ -1,138 +1,169 @@
-import argparse
-import json
-import os
-from config_manager import ConfigManager
+"""weight_config_tool.py
+Utility to manage scoring weights for :pyclass:`DualAnalysisSystem` and other
+components that may consume the same *weight map*.
 
-def setup_argparser():
-    parser = argparse.ArgumentParser(description='Quality Weights Configuration Tool')
-    
-    # Command subparsers
-    subparsers = parser.add_subparsers(dest='command', help='Command to execute')
-    
-    # List weights command
-    list_parser = subparsers.add_parser('list', help='List all current weights')
-    list_parser.add_argument('--json', action='store_true', help='Output in JSON format')
-    
-    # Set weight command
-    set_parser = subparsers.add_parser('set', help='Set a specific weight')
-    set_parser.add_argument('name', help='Name of the weight')
-    set_parser.add_argument('value', type=float, help='Value to set (0.0-1.0)')
-    
-    # Update from file command
-    update_parser = subparsers.add_parser('update-from-file', help='Update weights from JSON file')
-    update_parser.add_argument('file', help='Path to JSON file with weights')
-    
-    # Save weights command
-    save_parser = subparsers.add_parser('save', help='Save current weights to a config file')
-    save_parser.add_argument('--path', default='~/.tqa/config.json', help='Path to save config file')
-    
-    # Reset weights command
-    reset_parser = subparsers.add_parser('reset', help='Reset weights to default values')
-    
-    return parser
+The class is intentionally dependency-free – it only requires a duck-typed
+`ConfigManager` that exposes ``get(key, default)`` / ``set(key, value)`` /
+``save_config()``.
+"""
+from __future__ import annotations
 
-def main():
-    parser = setup_argparser()
-    args = parser.parse_args()
-    
-    # Initialize config manager
-    config_manager = ConfigManager()
-    
-    if args.command == 'list':
-        # List all weights
-        weights = config_manager.get_quality_weights()
-        
-        if args.json:
-            print(json.dumps(weights, indent=2))
-        else:
-            print("Current quality score weights:")
-            print("-" * 30)
-            
-            # Group weights by category
-            categories = {
-                "Embedding Metrics": ["embedding_similarity", "length_ratio_penalty", "embedding_metrics_weight"],
-                "Alignment Metrics": ["alignment_score", "recurring_pattern_penalty", "position_pattern_penalty", "alignment_metrics_weight"],
-                "Groq Simple Metrics": ["groq_score", "groq_simple_metrics_weight"],
-                "Groq Detailed Metrics": ["accuracy", "fluency", "terminology", "style", "groq_detailed_metrics_weight"]
-            }
-            
-            for category, weight_names in categories.items():
-                print(f"\n{category}:")
-                for name in weight_names:
-                    if name in weights:
-                        print(f"  {name}: {weights[name]:.2f}")
-            
-            # Print any uncategorized weights
-            uncategorized = [name for name in weights if not any(name in names for names in categories.values())]
-            if uncategorized:
-                print("\nOther Weights:")
-                for name in uncategorized:
-                    print(f"  {name}: {weights[name]:.2f}")
-    
-    elif args.command == 'set':
-        # Set a specific weight
-        name = args.name
-        value = args.value
-        
-        # Validate value
-        if value < 0 or value > 1:
-            print(f"Error: Weight value must be between 0.0 and 1.0")
-            return 1
-        
-        config_manager.set_weight(name, value)
-        print(f"Set {name} = {value:.2f}")
-        
-    elif args.command == 'update-from-file':
-        # Update weights from a JSON file
-        file_path = args.file
-        
-        if not os.path.exists(file_path):
-            print(f"Error: File {file_path} not found")
-            return 1
-            
+from typing import Dict, Any, Optional
+import logging
+
+logger = logging.getLogger(__name__)
+
+
+class WeightConfigTool:
+    """Simple manager for weight presets and persistence."""
+
+    _DEFAULT_WEIGHTS: Dict[str, float] = {
+        "embedding_similarity": 0.4,
+        "accuracy": 0.2,
+        "fluency": 0.15,
+        "terminology": 0.15,
+        "style": 0.1,
+    }
+
+    _BUILTIN_PRESETS: Dict[str, Dict[str, float]] = {
+        "balanced": _DEFAULT_WEIGHTS,
+        "semantic_focus": {
+            "embedding_similarity": 0.6,
+            "accuracy": 0.2,
+            "fluency": 0.1,
+            "terminology": 0.05,
+            "style": 0.05,
+        },
+        "accuracy_focus": {
+            "embedding_similarity": 0.3,
+            "accuracy": 0.5,
+            "fluency": 0.1,
+            "terminology": 0.05,
+            "style": 0.05,
+        },
+        "fluency_focus": {
+            "embedding_similarity": 0.2,
+            "accuracy": 0.2,
+            "fluency": 0.4,
+            "terminology": 0.1,
+            "style": 0.1,
+        },
+        "technical": {
+            "embedding_similarity": 0.3,
+            "accuracy": 0.3,
+            "fluency": 0.1,
+            "terminology": 0.3,
+            "style": 0.0,
+        },
+        "creative": {
+            "embedding_similarity": 0.1,
+            "accuracy": 0.2,
+            "fluency": 0.4,
+            "terminology": 0.1,
+            "style": 0.2,
+        },
+    }
+
+    # ------------------------------------------------------------------
+    def __init__(self, config_manager: Optional[Any] = None) -> None:
+        self.config = config_manager
+        self.presets: Dict[str, Dict[str, float]] = {
+            name: dict(weights) for name, weights in self._BUILTIN_PRESETS.items()
+        }
+        self._load_custom_presets()
+
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
+    def get_current_weights(self) -> Dict[str, float]:
+        if self.config:
+            w = self.config.get("scoring_weights", None)  # type: ignore[attr-defined]
+            if w and self._validate_weights(w):
+                return dict(w)
+        return self._DEFAULT_WEIGHTS.copy()
+
+    def set_weights(self, weights: Dict[str, float], *, save: bool = False) -> bool:
+        if not self._validate_weights(weights):
+            return False
+        norm = self._normalise(weights)
+        if save and self.config:
+            try:
+                self.config.set("scoring_weights", norm)  # type: ignore[attr-defined]
+                self.config.save_config()  # type: ignore[attr-defined]
+            except Exception as exc:  # pragma: no cover
+                logger.warning("Could not save weights: %s", exc)
+        return True
+
+    def reset_to_defaults(self, *, save: bool = False) -> Dict[str, float]:
+        if save and self.config:
+            try:
+                self.config.set("scoring_weights", self._DEFAULT_WEIGHTS)  # type: ignore[attr-defined]
+                self.config.save_config()  # type: ignore[attr-defined]
+            except Exception as exc:  # pragma: no cover
+                logger.warning("Could not save defaults: %s", exc)
+        return self._DEFAULT_WEIGHTS.copy()
+
+    def get_available_presets(self) -> Dict[str, Dict[str, float]]:
+        return {name: dict(w) for name, w in self.presets.items()}
+
+    def apply_preset(self, name: str, *, save: bool = False) -> Optional[Dict[str, float]]:
+        if name not in self.presets:
+            logger.error("Unknown preset '%s'", name)
+            return None
+        weights = self.presets[name]
+        self.set_weights(weights, save=save)
+        return dict(weights)
+
+    def save_custom_preset(self, name: str, weights: Dict[str, float]) -> bool:
+        if name in self._BUILTIN_PRESETS:
+            name = f"custom_{name}"
+        if not self._validate_weights(weights):
+            return False
+        self.presets[name] = self._normalise(weights)
+        if self.config:
+            try:
+                custom = self.config.get("weight_presets", {})  # type: ignore[attr-defined]
+                custom[name] = weights
+                self.config.set("weight_presets", custom)  # type: ignore[attr-defined]
+                self.config.save_config()  # type: ignore[attr-defined]
+            except Exception as exc:  # pragma: no cover
+                logger.warning("Could not persist preset: %s", exc)
+        return True
+
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
+    def _load_custom_presets(self):
+        if not self.config:
+            return
         try:
-            with open(file_path, 'r') as f:
-                weights = json.load(f)
-                
-            # Validate weights
-            invalid_weights = [name for name, val in weights.items() 
-                             if not isinstance(val, (int, float)) or val < 0 or val > 1]
-            
-            if invalid_weights:
-                print(f"Error: Invalid weight values for: {', '.join(invalid_weights)}")
-                return 1
-                
-            config_manager.update_weights(weights)
-            print(f"Updated {len(weights)} weights from {file_path}")
-            
-        except json.JSONDecodeError:
-            print(f"Error: File {file_path} is not valid JSON")
-            return 1
-        except Exception as e:
-            print(f"Error updating weights: {str(e)}")
-            return 1
-    
-    elif args.command == 'save':
-        # Save weights to a config file
-        path = os.path.expanduser(args.path)
-        
-        success = config_manager.save(path)
-        if success:
-            print(f"Configuration saved to {path}")
-        else:
-            print(f"Error saving configuration to {path}")
-            return 1
-    
-    elif args.command == 'reset':
-        # Reset weights to default
-        config_manager.reset_weights_to_default()
-        print("Weights reset to default values")
-    
-    else:
-        # No command specified
-        parser.print_help()
-    
-    return 0
+            extra = self.config.get("weight_presets", {})  # type: ignore[attr-defined]
+            for name, weights in extra.items():
+                if self._validate_weights(weights):
+                    self.presets[name] = self._normalise(weights)
+        except Exception as exc:  # pragma: no cover
+            logger.debug("No custom presets in config: %s", exc)
 
-if __name__ == '__main__':
-    exit(main()) 
+    @staticmethod
+    def _normalise(w: Dict[str, float]) -> Dict[str, float]:
+        total = sum(max(v, 0.0) for v in w.values())
+        if total <= 0:
+            return WeightConfigTool._DEFAULT_WEIGHTS.copy()
+        return {k: max(v, 0.0) / total for k, v in w.items()}
+
+    def _validate_weights(self, w: Dict[str, float]) -> bool:
+        keys = set(self._DEFAULT_WEIGHTS)
+        if not keys.issubset(w):
+            logger.error("Weights missing keys: %s", keys - set(w))
+            return False
+        if any(v < 0 for v in w.values()):
+            logger.error("Weights must be non-negative")
+            return False
+        if sum(w.values()) <= 0:
+            logger.error("Sum of weights must be > 0")
+            return False
+        return True
+
+# -----------------------------------------------------------------------------
+# End of public API – no CLI helper in this stripped-down version.
+# ----------------------------------------------------------------------------- 

@@ -1,25 +1,95 @@
 #!/usr/bin/env python3
 """
-Smart CLI Translation Quality Analyzer
-Main entry point for the command-line interface
+Enhanced Async Translation Quality Analyzer
+Main entry point for the command-line interface with comprehensive error handling,
+asynchronous processing, rich CLI, performance monitoring, and smart caching.
+
+Features:
+- Asynchronous processing with asyncio for concurrent operations
+- Rich CLI with interactive prompts and visualization
+- Smart-cache statistics and analysis
+- Performance monitoring with detailed reports
+- Rich progress bars and tables
+- Comprehensive error handling
+- Backward-compatible CLI entry point
 """
 
 import sys
 import os
 import argparse
 import logging
+import traceback
 import time
 import html as _html_mod
 import datetime
+import asyncio
+import functools
+import atexit
+import signal
+import contextlib
+import json
 from pathlib import Path
-from typing import List, Dict, Union, Optional, Any
+from typing import List, Dict, Union, Optional, Any, Tuple, Set, Callable
 import textwrap
+from contextlib import contextmanager
+from concurrent.futures import ThreadPoolExecutor
+
+# Rich imports
 from rich.console import Console
 from rich.panel import Panel
 from rich.table import Table
 from rich.syntax import Syntax
 from rich.box import Box
-from rich.progress import Progress
+from rich.progress import (
+    Progress, 
+    TextColumn, 
+    BarColumn, 
+    TaskProgressColumn, 
+    TimeRemainingColumn,
+    SpinnerColumn
+)
+from rich.prompt import Prompt, Confirm
+from rich.live import Live
+from rich.layout import Layout
+
+# Check for async libraries
+try:
+    import aiohttp
+    import aiofiles
+    HAS_ASYNC_LIBS = True
+except ImportError:
+    HAS_ASYNC_LIBS = False
+
+# Enhanced logger imports
+from logger_config import get_logger, log_performance, LogContext
+
+# Add performance monitoring imports
+try:
+    from performance_monitor import PerformanceMonitor
+    performance_monitoring_available = True
+except ImportError:
+    performance_monitoring_available = False
+
+# Add smart cache imports for statistics
+try:
+    from smart_cache import SmartCache, smart_cache
+    smart_cache_available = True
+except ImportError:
+    smart_cache_available = False
+    SmartCache = None
+
+# Import async components if available
+if HAS_ASYNC_LIBS:
+    try:
+        from async_groq_client import AsyncGroqClient
+        from async_embedding_generator import AsyncEmbeddingGenerator
+        from async_groq_evaluator import AsyncGroqEvaluator
+        from async_translation_quality_analyzer import AsyncTranslationQualityAnalyzer
+        ASYNC_COMPONENTS_AVAILABLE = True
+    except ImportError:
+        ASYNC_COMPONENTS_AVAILABLE = False
+else:
+    ASYNC_COMPONENTS_AVAILABLE = False
 
 # Import our components
 from config_manager import ConfigManager
@@ -29,6 +99,18 @@ from embedding_generator import MultilingualEmbeddingGenerator
 from similarity_calculator import SimilarityCalculator
 from language_utils import LanguageDetector, EmbeddingBasedLanguageDetector, get_supported_languages
 from analyzer import TranslationQualityAnalyzer
+
+# Import sync fallback components
+from groq_client import GroqClient
+from groq_evaluator import GroqEvaluator
+from translation_quality_analyzer import TranslationQualityAnalyzer as SyncTranslationQualityAnalyzer, EmbeddingGenerator
+from embedding_cache import EmbeddingCache
+
+# Import additional components
+try:
+    from batch_processor import BatchProcessor
+except ImportError:
+    BatchProcessor = None
 
 # Candidate ranking relies on additional utilities
 # Import optional dependencies lazily to avoid overhead when not used.
@@ -91,16 +173,783 @@ def output_html(
     html_parts.append("</body></html>")
     return "\n".join(html_parts)
 
+
+class AsyncTranslationEvaluator:
+    """
+    Enhanced async translation evaluator that provides backward compatibility
+    with the original main.py functionality while adding async processing capabilities.
+    """
+    
+    def __init__(self, config_path: Optional[str] = None, interactive: bool = False):
+        """Initialize the async translation evaluator."""
+        self.config = ConfigManager(config_path) if config_path else ConfigManager()
+        self.interactive = interactive
+        
+        # Performance monitoring
+        self.performance_monitor = PerformanceMonitor() if performance_monitoring_available else None
+        self.perf_data = {}
+        
+        # Note: PerformanceMonitor doesn't have register_callback method
+        # We'll track performance manually in the perf_data dictionary
+        
+        # Async settings
+        self.max_concurrent_embeddings = self.config.get("async.max_concurrent_embeddings", default=10)
+        self.max_concurrent_api_calls = self.config.get("async.max_concurrent_api_calls", default=5)
+        
+        # Thread pool for CPU-bound operations
+        self.thread_pool = ThreadPoolExecutor(max_workers=self.config.get("async.thread_workers", default=4))
+        
+        # Semaphores
+        self.embedding_semaphore = asyncio.Semaphore(self.max_concurrent_embeddings)
+        self.api_semaphore = asyncio.Semaphore(self.max_concurrent_api_calls)
+        
+        # Caching
+        self.cache_dir = self.config.get("cache.directory", default="cache")
+        self.embedding_cache = EmbeddingCache(
+            max_size=self.config.get("cache.embedding_size", default=10000)
+        )
+        
+        # Smart cache if available
+        if SmartCache:
+            self.smart_cache = SmartCache(
+                cache_dir=self.cache_dir,
+                ttl=self.config.get("cache.ttl", default=86400),
+                max_size=self.config.get("cache.max_size", default=1000)
+            )
+        else:
+            self.smart_cache = None
+        
+        # Shutdown event
+        self.shutdown_event = asyncio.Event()
+        
+        # Components (initialized later)
+        self.model_loader = None
+        self.embedding_generator = None
+        self.groq_client = None
+        self.groq_evaluator = None
+        self.quality_analyzer = None
+        self.analyzer = None  # For backward compatibility
+        
+        self.initialized = False
+        self.use_async = HAS_ASYNC_LIBS and ASYNC_COMPONENTS_AVAILABLE
+        
+        logger.info(f"{'Async' if self.use_async else 'Sync'} Translation Evaluator initialized")
+        
+        # Register shutdown handlers
+        atexit.register(self._sync_shutdown_handler)
+    
+    def _sync_shutdown_handler(self):
+        """Synchronous shutdown handler for atexit."""
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        try:
+            loop.run_until_complete(self._shutdown())
+        finally:
+            loop.close()
+    
+    async def _shutdown(self):
+        """Perform graceful shutdown operations."""
+        logger.info("Performing graceful shutdown...")
+        self.shutdown_event.set()
+        await self.close()
+    
+    def _update_performance_data(self, operation: str, duration: float, metadata: Dict[str, Any]):
+        """Callback for performance monitor to update performance data."""
+        if operation not in self.perf_data:
+            self.perf_data[operation] = {
+                "count": 0, "total_time": 0.0, "min_time": float("inf"), 
+                "max_time": 0.0, "avg_time": 0.0
+            }
+        
+        data = self.perf_data[operation]
+        data["count"] += 1
+        data["total_time"] += duration
+        data["min_time"] = min(data["min_time"], duration)
+        data["max_time"] = max(data["max_time"], duration)
+        data["avg_time"] = data["total_time"] / data["count"]
+    
+    async def initialize(self) -> None:
+        """Initialize async components and resources."""
+        if self.initialized:
+            return
+        
+        with LogContext(operation="initialization"):
+            logger.info("Initializing components...")
+            
+            # Initialize model loader
+            self.model_loader = ModelLoader(config=self.config)
+            # Model will be loaded lazily when needed
+            
+            # Initialize components based on availability
+            if self.use_async:
+                # Async components (fallback to sync for now)
+                self.embedding_generator = EmbeddingGenerator(
+                    use_cache=True
+                )
+                
+                self.groq_client = GroqClient(
+                    api_key=self.config.get_api_key("groq")
+                )
+                
+                self.groq_evaluator = GroqEvaluator(self.groq_client)
+                
+                self.quality_analyzer = SyncTranslationQualityAnalyzer(
+                    embedding_generator=self.embedding_generator, 
+                    groq_evaluator=self.groq_evaluator,
+                    config_manager=self.config
+                )
+            else:
+                # Sync components  
+                self.embedding_generator = EmbeddingGenerator(
+                    use_cache=True
+                )
+                
+                self.groq_client = GroqClient(
+                    api_key=self.config.get_api_key("groq")
+                )
+                
+                self.groq_evaluator = GroqEvaluator(self.groq_client)
+                
+                self.quality_analyzer = SyncTranslationQualityAnalyzer(
+                    self.embedding_generator, self.groq_evaluator, self.config
+                )
+            
+            # For backward compatibility
+            self.analyzer = self.quality_analyzer
+            
+            self.initialized = True
+            logger.info("Components initialized successfully")
+    
+    async def close(self) -> None:
+        """Close resources and connections."""
+        if hasattr(self, 'groq_client') and self.groq_client:
+            if hasattr(self.groq_client, 'session') and hasattr(self.groq_client.session, 'closed'):
+                if not self.groq_client.session.closed:
+                    await self.groq_client.session.close()
+        
+        self.thread_pool.shutdown(wait=False)
+        
+        if self.embedding_cache:
+            # EmbeddingCache is already in memory, no need to save to disk
+            self.embedding_cache.clear()
+        
+        if self.smart_cache:
+            self.smart_cache.save()
+        
+        logger.info("Resources closed successfully")
+    
+    async def analyze_translation(
+        self, 
+        source_text: str, 
+        translated_text: str,
+        source_lang: str = 'en',
+        target_lang: str = 'es',
+        include_error_analysis: bool = False
+    ) -> Dict[str, Any]:
+        """
+        Analyze a translation with backward compatibility for the original interface.
+        """
+        if not self.initialized:
+            await self.initialize()
+        
+        with LogContext(source_lang=source_lang, target_lang=target_lang):
+            # Use sync analyzer with async wrapper (since async components don't exist yet)
+            def analyze_wrapper():
+                return self.quality_analyzer.analyze_pair(
+                    source_text, translated_text, use_groq=True, detailed=False
+                )
+            
+            result = await asyncio.get_event_loop().run_in_executor(
+                self.thread_pool, analyze_wrapper
+            )
+            
+            # Add backward compatibility fields if needed
+            if 'embedding_similarity' not in result and 'similarity' in result:
+                result['embedding_similarity'] = result['similarity']
+            
+            return result
+    
+    async def demo_translation_evaluation(self):
+        """Interactive demo for translation evaluation."""
+        if not console:
+            logger.warning("Rich console not available for demo")
+            return
+            
+        console.print(Panel.fit(
+            "[bold green]Translation Evaluation Demo[/bold green]\n"
+            "This demo will evaluate the quality of a translation using multiple methods."
+        ))
+        
+        # Sample translation pairs for demo
+        samples = [
+            {
+                "source": "The quick brown fox jumps over the lazy dog.",
+                "target": "El zorro marrón rápido salta sobre el perro perezoso.",
+                "source_lang": "en",
+                "target_lang": "es",
+                "description": "Classic pangram"
+            },
+            {
+                "source": "It was the best of times, it was the worst of times.",
+                "target": "Era el mejor de los tiempos, era el peor de los tiempos.",
+                "source_lang": "en",
+                "target_lang": "es",
+                "description": "Literature (A Tale of Two Cities)"
+            },
+            {
+                "source": "Machine learning is a subset of artificial intelligence.",
+                "target": "El aprendizaje automático es un subconjunto de la inteligencia artificial.",
+                "source_lang": "en",
+                "target_lang": "es",
+                "description": "Technical content"
+            }
+        ]
+        
+        # Ask user to select a sample or enter custom text
+        console.print("[bold]Choose an option:[/bold]")
+        console.print("1. Use a sample translation")
+        console.print("2. Enter your own translation")
+        
+        choice = Prompt.ask("Enter your choice", choices=["1", "2"], default="1")
+        
+        if choice == "1":
+            # Display sample options
+            console.print("\n[bold]Select a sample translation:[/bold]")
+            for i, sample in enumerate(samples):
+                console.print(f"{i+1}. [cyan]{sample['description']}[/cyan]")
+                console.print(f"   Source ({sample['source_lang']}): {sample['source']}")
+                console.print(f"   Target ({sample['target_lang']}): {sample['target']}")
+                console.print()
+                
+            sample_choice = Prompt.ask(
+                "Select a sample", 
+                choices=[str(i+1) for i in range(len(samples))],
+                default="1"
+            )
+            
+            selected = samples[int(sample_choice) - 1]
+            source_text = selected["source"]
+            translated_text = selected["target"]
+            source_lang = selected["source_lang"]
+            target_lang = selected["target_lang"]
+            
+        else:
+            # Get custom input
+            console.print("\n[bold]Enter your translation:[/bold]")
+            source_text = Prompt.ask("Source text")
+            source_lang = Prompt.ask("Source language code", default="en")
+            translated_text = Prompt.ask("Translated text")
+            target_lang = Prompt.ask("Target language code", default="es")
+        
+        # Display processing status
+        with console.status("[bold green]Evaluating translation...[/bold green]"):
+            # Run the evaluation
+            result = await self.analyze_translation(
+                source_text, translated_text, source_lang, target_lang
+            )
+        
+        # Display results
+        self._display_evaluation_results(result)
+        
+        # Ask if user wants to try another translation
+        if Confirm.ask("\nWould you like to evaluate another translation?", default=False):
+            await self.demo_translation_evaluation()
+        
+        return result
+    
+    def _display_evaluation_results(self, result: Dict[str, Any]) -> None:
+        """Display evaluation results using rich."""
+        if not console:
+            return
+            
+        # Create results panel
+        console.print("\n[bold]Evaluation Results:[/bold]")
+        
+        # Display source and translation
+        source = result.get('source_text', '')
+        translation = result.get('translated_text', '')
+        
+        console.print(Panel(
+            f"[bold]Source[/bold] ({result.get('source_language', 'unknown')}):\n{source}",
+            border_style="blue"
+        ))
+        console.print(Panel(
+            f"[bold]Translation[/bold] ({result.get('target_language', 'unknown')}):\n{translation}",
+            border_style="green"
+        ))
+        
+        # Display scores
+        embedding_score = result.get('embedding_similarity', 0)
+        groq_score = result.get('groq_quality_score', 0)
+        combined_score = result.get('combined_score', 0)
+        
+        # Color-code scores
+        def color_score(score, max_val=1.0):
+            normalized = score / max_val
+            if normalized >= 0.8:
+                return f"[green]{score:.2f}[/green]"
+            elif normalized >= 0.6:
+                return f"[yellow]{score:.2f}[/yellow]"
+            else:
+                return f"[red]{score:.2f}[/red]"
+        
+        # Create scores table
+        scores_table = Table(show_header=True, header_style="bold")
+        scores_table.add_column("Metric")
+        scores_table.add_column("Score")
+        
+        scores_table.add_row("Embedding Similarity", color_score(embedding_score))
+        scores_table.add_row("Groq Quality Score", color_score(groq_score, 10.0))
+        scores_table.add_row("Combined Score", color_score(combined_score))
+        
+        console.print(scores_table)
+        
+        # Display Groq analysis if available
+        strengths = result.get('groq_strengths', [])
+        weaknesses = result.get('groq_weaknesses', [])
+        analysis = result.get('groq_analysis', '')
+        
+        if analysis or strengths or weaknesses:
+            console.print("\n[bold]Groq Analysis:[/bold]")
+            
+            if strengths:
+                console.print("[bold green]Strengths:[/bold green]")
+                for strength in strengths:
+                    console.print(f"  ✓ {strength}")
+            
+            if weaknesses:
+                console.print("[bold red]Weaknesses:[/bold red]")
+                for weakness in weaknesses:
+                    console.print(f"  ✗ {weakness}")
+            
+            if analysis:
+                console.print(Panel(analysis, title="Detailed Analysis"))
+    
+    async def process_file(self, file_path: Union[str, Path]) -> Dict[str, Any]:
+        """Process a single file containing translations."""
+        if not self.initialized:
+            await self.initialize()
+            
+        file_path = Path(file_path)
+        with LogContext(operation="file_processing", file=str(file_path)):
+            logger.info(f"Processing file: {file_path}")
+            
+            try:
+                # Read file asynchronously if available
+                if HAS_ASYNC_LIBS:
+                    async with aiofiles.open(file_path, 'r', encoding='utf-8') as f:
+                        content = await f.read()
+                else:
+                    # Fallback to sync reading in thread pool
+                    content = await asyncio.get_event_loop().run_in_executor(
+                        self.thread_pool,
+                        lambda: file_path.read_text(encoding='utf-8')
+                    )
+                
+                # Parse content (JSON format)
+                try:
+                    data = json.loads(content)
+                except json.JSONDecodeError:
+                    # Try as line-delimited JSON
+                    data = []
+                    for line in content.splitlines():
+                        if line.strip():
+                            try:
+                                item = json.loads(line)
+                                data.append(item)
+                            except json.JSONDecodeError:
+                                logger.warning(f"Skipping invalid JSON line: {line[:100]}...")
+                
+                if isinstance(data, dict):
+                    data = [data]
+                
+                # Process each item
+                results = []
+                for item in data:
+                    try:
+                        source_text = item.get('source_text', item.get('source', ''))
+                        translated_text = item.get('translated_text', item.get('translation', item.get('target', '')))
+                        source_lang = item.get('source_lang', item.get('source_language', 'en'))
+                        target_lang = item.get('target_lang', item.get('target_language', 'es'))
+                        
+                        result = await self.analyze_translation(
+                            source_text, translated_text, source_lang, target_lang
+                        )
+                        results.append(result)
+                        
+                    except Exception as e:
+                        logger.error(f"Error processing item: {str(e)}")
+                        results.append({
+                            "error": str(e),
+                            "source_text": item.get('source_text', ''),
+                            "translated_text": item.get('translated_text', ''),
+                            "status": "error"
+                        })
+                
+                # Prepare output path
+                output_dir = Path("output")
+                output_dir.mkdir(exist_ok=True)
+                output_path = output_dir / f"{file_path.stem}_results.json"
+                
+                # Write results
+                if HAS_ASYNC_LIBS:
+                    async with aiofiles.open(output_path, 'w', encoding='utf-8') as f:
+                        await f.write(json.dumps(results, indent=2))
+                else:
+                    await asyncio.get_event_loop().run_in_executor(
+                        self.thread_pool,
+                        lambda: output_path.write_text(json.dumps(results, indent=2), encoding='utf-8')
+                    )
+                
+                logger.info(f"Results saved to {output_path}")
+                
+                result = {
+                    "file_path": str(file_path),
+                    "output_path": str(output_path),
+                    "items_processed": len(results),
+                    "successful_items": sum(1 for r in results if "error" not in r),
+                    "status": "success",
+                    "timestamp": datetime.datetime.now().isoformat()
+                }
+                
+                return result
+            
+            except Exception as e:
+                logger.error(f"Error processing file {file_path}: {str(e)}", exc_info=True)
+                return {
+                    "file_path": str(file_path),
+                    "status": "error",
+                    "error": str(e),
+                    "timestamp": datetime.datetime.now().isoformat()
+                }
+    
+    async def process_directory(self, directory_path: Union[str, Path], pattern: str = "*.json") -> List[Dict[str, Any]]:
+        """Process all matching files in a directory."""
+        if not self.initialized:
+            await self.initialize()
+            
+        directory_path = Path(directory_path)
+        with LogContext(operation="directory_processing", directory=str(directory_path)):
+            logger.info(f"Processing directory: {directory_path} (pattern: {pattern})")
+            
+            # Find all matching files
+            files = list(directory_path.glob(pattern))
+            logger.info(f"Found {len(files)} files matching pattern")
+            
+            # Process files sequentially to avoid overwhelming the system
+            results = []
+            for file_path in files:
+                try:
+                    result = await self.process_file(file_path)
+                    results.append(result)
+                    logger.info(f"Processed {file_path}")
+                except Exception as e:
+                    logger.error(f"Error processing {file_path}: {str(e)}")
+                    results.append({
+                        "file_path": str(file_path),
+                        "status": "error",
+                        "error": str(e),
+                        "timestamp": datetime.datetime.now().isoformat()
+                    })
+            
+            successful = sum(1 for r in results if r.get("status") == "success")
+            logger.info(f"Directory processing completed: {successful}/{len(results)} files successful")
+            
+            return results
+
+
 # Configure logging
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     handlers=[
         logging.StreamHandler(),
+        logging.FileHandler('translation_evaluator.log')
     ]
 )
 
-logger = logging.getLogger('tqa')
+# Get enhanced logger for main module
+logger = get_logger(__name__, "system")
+
+# Create a global performance monitor object
+performance_monitor = None
+
+# Global console for rich output
+console = Console()
+
+@contextmanager
+def monitor_operation(operation_name):
+    """Context manager for timing operations and tracking performance."""
+    global performance_monitor
+    start_time = time.time()
+    success = True
+    
+    try:
+        if performance_monitor:
+            performance_monitor.start_timer(operation_name)
+        yield
+    except Exception as e:
+        success = False
+        raise e
+    finally:
+        elapsed = time.time() - start_time
+        if performance_monitor:
+            if operation_name.startswith("api_"):
+                # For API operations, we record both the timer and API stats
+                parts = operation_name.split("_", 2)
+                if len(parts) == 3:  # api_name_endpoint
+                    api_name, endpoint = parts[1], parts[2]
+                    error_message = None if success else str(sys.exc_info()[1])
+                    performance_monitor.record_api_response(
+                        api_name, endpoint, elapsed, success, error_message=error_message
+                    )
+                performance_monitor.stop_timer(operation_name)
+            elif operation_name.startswith("component_"):
+                # For component operations
+                component_name = operation_name[10:]  # Remove "component_" prefix
+                performance_monitor.record_component_execution(component_name, success, elapsed)
+                performance_monitor.stop_timer(operation_name)
+            else:
+                # For regular operations
+                performance_monitor.stop_timer(operation_name)
+
+def setup_components():
+    """Set up the required components for translation evaluation with error handling and performance monitoring."""
+    global performance_monitor
+    
+    components = {
+        "analyzer": None,
+        "dual_system": None,
+        "config_manager": None,
+        "weight_config_tool": None,
+        "errors": []
+    }
+    
+    try:
+        # Initialize performance monitor first if available
+        if performance_monitoring_available:
+            try:
+                performance_monitor = PerformanceMonitor(log_dir="./logs/performance")
+                logging.info("Performance monitoring initialized")
+            except Exception as e:
+                logging.error(f"Failed to initialize performance monitoring: {e}")
+                performance_monitor = None
+        
+        # Import all required modules with error handling and performance tracking
+        with monitor_operation("component_config_manager"):
+            try:
+                from config_manager import ConfigManager
+                components["config_manager"] = ConfigManager()
+                # Update performance monitor with config manager if needed
+                if performance_monitor and components["config_manager"]:
+                    performance_monitor = PerformanceMonitor(
+                        config_manager=components["config_manager"],
+                        log_dir=components["config_manager"].get("performance_log_dir", "./logs/performance")
+                    )
+                logging.info("Configuration manager initialized successfully")
+            except ImportError as e:
+                logging.warning(f"Could not import ConfigManager: {e}")
+                components["errors"].append(f"No configuration manager available: {str(e)}")
+            except Exception as e:
+                logging.error(f"Error initializing ConfigManager: {e}")
+                components["errors"].append(f"Configuration manager initialization failed: {str(e)}")
+        
+        # Set up embedding components with performance monitoring
+        embedding_generator = None
+        with monitor_operation("component_embedding"):
+            try:
+                from model_loader import ModelLoader
+                from translation_quality_analyzer import EmbeddingGenerator
+                from embedding_cache import EmbeddingCache
+                
+                cache_dir = components["config_manager"].get("cache_dir", "./cache") if components["config_manager"] else "./cache"
+                model_name = components["config_manager"].get("model", "all-MiniLM-L6-v2") if components["config_manager"] else "all-MiniLM-L6-v2"
+                
+                # Initialize embedding cache
+                embedding_cache = EmbeddingCache(cache_dir=cache_dir)
+                logging.info("Embedding cache initialized")
+                
+                # Initialize model loader
+                model_loader = ModelLoader(model_name=model_name, cache_dir=cache_dir)
+                logging.info(f"Model loader initialized with model: {model_name}")
+                
+                # Initialize embedding generator
+                embedding_generator = EmbeddingGenerator(model_loader, embedding_cache)
+                logging.info("Embedding generator initialized successfully")
+                
+            except ImportError as e:
+                logging.error(f"Could not import embedding modules: {e}")
+                components["errors"].append(f"Embedding functionality not available: {str(e)}")
+            except Exception as e:
+                logging.error(f"Error initializing embedding components: {e}")
+                components["errors"].append(f"Embedding initialization failed: {str(e)}")
+        
+        # Initialize text processor with performance monitoring
+        text_processor = None
+        with monitor_operation("component_text_processor"):
+            try:
+                from text_processor import TextProcessor
+                text_processor = TextProcessor()
+                logging.info("Text processor initialized")
+            except ImportError as e:
+                logging.warning(f"Could not import TextProcessor: {e}")
+                components["errors"].append(f"Text processing not available: {str(e)}")
+            except Exception as e:
+                logging.error(f"Error initializing TextProcessor: {e}")
+                components["errors"].append(f"Text processor initialization failed: {str(e)}")
+        
+        # Initialize segment alignment analyzer with performance monitoring
+        segment_alignment_analyzer = None
+        with monitor_operation("component_segment_alignment"):
+            try:
+                import segment_alignment
+                segment_alignment_analyzer = segment_alignment.SegmentAlignmentAnalyzer(
+                    embedding_generator, text_processor
+                )
+                logging.info("Segment alignment analyzer initialized")
+            except (ImportError, AttributeError) as e:
+                logging.warning(f"Could not import SegmentAlignmentAnalyzer: {e}")
+                components["errors"].append("Segment alignment not available")
+            except Exception as e:
+                logging.error(f"Error initializing SegmentAlignmentAnalyzer: {e}")
+                components["errors"].append(f"Segment alignment initialization failed: {str(e)}")
+        
+        # Initialize Groq components with performance monitoring
+        groq_client = None
+        groq_evaluator = None
+        with monitor_operation("component_groq"):
+            try:
+                from groq_client import GroqClient
+                from groq_evaluator import GroqTranslationEvaluator
+                
+                groq_api_key = None
+                if components["config_manager"]:
+                    groq_api_key = components["config_manager"].get_api_key("groq")
+                
+                if not groq_api_key:
+                    groq_api_key = os.environ.get("GROQ_API_KEY")
+                
+                if groq_api_key:
+                    try:
+                        groq_client = GroqClient(api_key=groq_api_key)
+                        # Wrap API methods of groq_client with performance monitoring
+                        if performance_monitor:
+                            original_evaluate_translation = groq_client.evaluate_translation
+                            original_generate_completion = groq_client.generate_completion
+                            original_generate_chat_completion = groq_client.generate_chat_completion
+                            
+                            def wrapped_evaluate_translation(*args, **kwargs):
+                                with monitor_operation("api_groq_evaluate_translation"):
+                                    return original_evaluate_translation(*args, **kwargs)
+                            
+                            def wrapped_generate_completion(*args, **kwargs):
+                                with monitor_operation("api_groq_generate_completion"):
+                                    return original_generate_completion(*args, **kwargs)
+                            
+                            def wrapped_generate_chat_completion(*args, **kwargs):
+                                with monitor_operation("api_groq_generate_chat_completion"):
+                                    return original_generate_chat_completion(*args, **kwargs)
+                            
+                            groq_client.evaluate_translation = wrapped_evaluate_translation
+                            groq_client.generate_completion = wrapped_generate_completion
+                            groq_client.generate_chat_completion = wrapped_generate_chat_completion
+                        
+                        groq_evaluator = GroqTranslationEvaluator(groq_client)
+                        logging.info("Groq evaluation services initialized successfully")
+                    except Exception as e:
+                        logging.warning(f"Failed to initialize Groq services with API key: {e}")
+                        components["errors"].append(f"Groq API initialization failed: {str(e)}")
+                else:
+                    logging.warning("Groq API key not found. Linguistic assessment will not be available.")
+                    components["errors"].append("Groq API key not found. Linguistic assessment will be limited.")
+            except ImportError as e:
+                logging.warning(f"Could not import Groq modules: {e}")
+                components["errors"].append(f"Groq functionality not available: {str(e)}")
+            except Exception as e:
+                logging.error(f"Error initializing Groq components: {e}")
+                components["errors"].append(f"Groq initialization failed: {str(e)}")
+        
+        # Initialize weight config tool with performance monitoring
+        weight_config_tool = None
+        with monitor_operation("component_weight_config"):
+            try:
+                from weight_config_tool import WeightConfigTool
+                weight_config_tool = WeightConfigTool(components["config_manager"])
+                components["weight_config_tool"] = weight_config_tool
+                logging.info("Weight configuration tool initialized")
+            except ImportError as e:
+                logging.warning(f"Could not import WeightConfigTool: {e}")
+                components["errors"].append("Weight configuration tool not available")
+            except Exception as e:
+                logging.error(f"Error initializing WeightConfigTool: {e}")
+                components["errors"].append(f"Weight configuration tool initialization failed: {str(e)}")
+        
+        # Initialize translation quality analyzer with performance monitoring
+        with monitor_operation("component_translation_quality_analyzer"):
+            try:
+                from translation_quality_analyzer import TranslationQualityAnalyzer
+                analyzer = TranslationQualityAnalyzer(
+                    embedding_generator=embedding_generator,
+                    groq_evaluator=groq_evaluator,
+                    config_manager=components["config_manager"],
+                    text_processor=text_processor,
+                    segment_alignment=segment_alignment_analyzer
+                )
+                components["analyzer"] = analyzer
+                logging.info("Translation quality analyzer initialized")
+            except ImportError as e:
+                logging.error(f"Could not import TranslationQualityAnalyzer: {e}")
+                components["errors"].append(f"Translation quality analyzer not available: {str(e)}")
+            except Exception as e:
+                logging.error(f"Error initializing TranslationQualityAnalyzer: {e}")
+                components["errors"].append(f"Translation quality analyzer initialization failed: {str(e)}")
+        
+        # Initialize dual analysis system with performance monitoring
+        with monitor_operation("component_dual_analysis_system"):
+            try:
+                from dual_analysis_system import DualAnalysisSystem
+                dual_system = DualAnalysisSystem(
+                    embedding_generator=embedding_generator,
+                    groq_evaluator=groq_evaluator,
+                    config_manager=components["config_manager"],
+                    text_processor=text_processor
+                )
+                components["dual_system"] = dual_system
+                logging.info("Dual analysis system initialized")
+            except ImportError as e:
+                logging.warning(f"Could not import DualAnalysisSystem: {e}")
+                components["errors"].append(f"Dual analysis system not available: {str(e)}")
+            except Exception as e:
+                logging.error(f"Error initializing DualAnalysisSystem: {e}")
+                components["errors"].append(f"Dual analysis system initialization failed: {str(e)}")
+        
+        # Log the number of errors encountered during setup
+        components_status = {
+            "analyzer": components["analyzer"] is not None,
+            "dual_system": components["dual_system"] is not None,
+            "config_manager": components["config_manager"] is not None,
+            "weight_config_tool": components["weight_config_tool"] is not None,
+            "embedding": embedding_generator is not None,
+            "groq": groq_evaluator is not None,
+            "text_processor": text_processor is not None,
+            "performance_monitor": performance_monitor is not None
+        }
+        
+        logging.info(f"Components initialized with status: {components_status}")
+        if components["errors"]:
+            logging.warning(f"Setup completed with {len(components['errors'])} warnings/errors")
+        else:
+            logging.info("Setup completed successfully with no errors")
+            
+        # Add performance monitor to components
+        components["performance_monitor"] = performance_monitor
+            
+        return components
+            
+    except Exception as e:
+        logging.critical(f"Critical error during component setup: {e}\n{traceback.format_exc()}")
+        components["errors"].append(f"Critical setup error: {str(e)}")
+        return components
 
 def setup_argparser() -> argparse.ArgumentParser:
     """
@@ -349,6 +1198,56 @@ def setup_argparser() -> argparse.ArgumentParser:
         help='Run a demo of custom quality score weights'
     )
     
+    # Add performance monitoring options
+    perf_group = parser.add_argument_group('Performance monitoring')
+    perf_group.add_argument('--monitor', action='store_true', 
+                          help='Enable detailed performance monitoring')
+    perf_group.add_argument('--performance-report', action='store_true',
+                          help='Generate performance report after execution')
+    perf_group.add_argument('--performance-output', 
+                          help='Output file for performance report')
+    perf_group.add_argument('--performance-format', 
+                          choices=['markdown', 'text', 'json'], default='markdown',
+                          help='Format for performance report')
+    
+    # Add cache statistics and management options  
+    cache_group = parser.add_argument_group('Cache management')
+    cache_group.add_argument('--cache-stats', action='store_true',
+                          help='Display detailed cache statistics')
+    cache_group.add_argument('--cache-stats-format', 
+                          choices=['text', 'json', 'markdown', 'html'], 
+                          default='text',
+                          help='Format for cache statistics output')
+    cache_group.add_argument('--cache-stats-output', 
+                          help='Save cache statistics to file')
+    cache_group.add_argument('--cache-analyze', action='store_true',
+                          help='Analyze cache performance and provide recommendations')
+    cache_group.add_argument('--disable-cache', action='store_true',
+                          help='Disable the cache for this execution')
+    
+    # Add async processing options
+    async_group = parser.add_argument_group('Async Processing')
+    async_group.add_argument('--async-mode', action='store_true',
+                           help='Enable asynchronous processing mode')
+    async_group.add_argument('--max-concurrent-embeddings', type=int, default=10,
+                           help='Maximum concurrent embedding operations')
+    async_group.add_argument('--max-concurrent-api-calls', type=int, default=5,
+                           help='Maximum concurrent API calls')
+    async_group.add_argument('--thread-workers', type=int, default=4,
+                           help='Number of thread pool workers for CPU-bound operations')
+    async_group.add_argument('--batch-file', type=str,
+                           help='Process a batch file of translations (JSON format)')
+    async_group.add_argument('--batch-directory', type=str,
+                           help='Process all files in a directory')
+    async_group.add_argument('--file-pattern', type=str, default='*.json',
+                           help='File pattern for batch directory processing')
+    async_group.add_argument('--demo', action='store_true',
+                           help='Run interactive demonstration')
+    async_group.add_argument('--benchmark', action='store_true',
+                           help='Run performance benchmark')
+    async_group.add_argument('--benchmark-iterations', type=int, default=100,
+                           help='Number of iterations for benchmark')
+    
     return parser
 
 def read_file_text(file_path: str) -> str:
@@ -516,6 +1415,522 @@ def write_to_file(file_path: str, content: str):
         logger.error(f"Error writing to file {file_path}: {e}")
         return False
 
+def format_cache_stats(stats, format='text'):
+    """
+    Format cache statistics for display.
+    
+    Args:
+        stats: Cache statistics dictionary
+        format: Output format ('text', 'json', 'markdown', or 'html')
+        
+    Returns:
+        Formatted statistics string
+    """
+    import json
+    import math
+    
+    if format == 'json':
+        return json.dumps(stats, indent=2)
+        
+    # For non-JSON formats, prepare the data
+    memory_size = stats.get('memory_size', 0)
+    memory_max = stats.get('memory_max_size', 0)
+    disk_size = stats.get('disk_size', 0)
+    disk_max = stats.get('disk_max_size', 0)
+    
+    memory_usage_pct = (memory_size / memory_max * 100) if memory_max > 0 else 0
+    disk_usage_pct = (disk_size / disk_max * 100) if disk_max > 0 else 0
+    
+    memory_hits = stats.get('memory_hits', 0)
+    memory_misses = stats.get('memory_misses', 0)
+    disk_hits = stats.get('disk_hits', 0)
+    disk_misses = stats.get('disk_misses', 0)
+    
+    total_requests = memory_hits + memory_misses
+    memory_hit_rate = (memory_hits / total_requests * 100) if total_requests > 0 else 0
+    
+    total_disk_requests = disk_hits + disk_misses
+    disk_hit_rate = (disk_hits / total_disk_requests * 100) if total_disk_requests > 0 else 0
+    
+    overall_hits = memory_hits + disk_hits
+    overall_requests = total_requests + total_disk_requests - disk_hits  # Avoid double counting
+    overall_hit_rate = (overall_hits / overall_requests * 100) if overall_requests > 0 else 0
+    
+    memory_evictions = stats.get('memory_evictions', 0)
+    disk_evictions = stats.get('disk_evictions', 0)
+    
+    api_calls_saved = stats.get('api_calls_saved', 0)
+    computation_time_saved = stats.get('computation_time_saved', 0)
+    bytes_saved = stats.get('bytes_saved', 0)
+    
+    # Calculate derived metrics
+    if computation_time_saved > 0:
+        time_saved_str = format_time_duration(computation_time_saved)
+    else:
+        time_saved_str = "0 seconds"
+        
+    if bytes_saved > 0:
+        data_saved_str = format_file_size(bytes_saved)
+    else:
+        data_saved_str = "0 bytes"
+    
+    # Format based on output type
+    if format == 'markdown':
+        return f"""# Smart Cache Statistics
+
+## Cache Utilization
+- **Memory Cache:** {memory_size:,} / {memory_max:,} items ({memory_usage_pct:.1f}%)
+- **Disk Cache:** {disk_size:,} / {disk_max:,} items ({disk_usage_pct:.1f}%)
+
+## Hit Rates
+- **Memory Hit Rate:** {memory_hit_rate:.2f}% ({memory_hits:,} hits, {memory_misses:,} misses)
+- **Disk Hit Rate:** {disk_hit_rate:.2f}% ({disk_hits:,} hits, {disk_misses:,} misses)
+- **Overall Hit Rate:** {overall_hit_rate:.2f}% ({overall_hits:,} total hits)
+
+## Cache Operations
+- **Memory Evictions:** {memory_evictions:,} items
+- **Disk Evictions:** {disk_evictions:,} items
+
+## Resource Savings
+- **API Calls Saved:** {api_calls_saved:,} calls
+- **Computation Time Saved:** {time_saved_str}
+- **Data Transfer Saved:** {data_saved_str}
+
+## Efficiency
+- **Cache Efficiency Score:** {calculate_cache_efficiency(stats):.1f}/10
+"""
+    elif format == 'html':
+        def hit_rate_class(rate):
+            if rate >= 80:
+                return "good"
+            elif rate >= 50:
+                return "average"
+            else:
+                return "poor"
+        
+        def efficiency_class(score):
+            if score >= 7:
+                return "good"
+            elif score >= 4:
+                return "average"
+            else:
+                return "poor"
+        
+        return f"""<!DOCTYPE html>
+<html>
+<head>
+<title>Smart Cache Statistics</title>
+<style>
+    body {{ font-family: Arial, sans-serif; max-width: 800px; margin: 0 auto; padding: 20px; }}
+    h1, h2 {{ color: #333; }}
+    .stat-group {{ margin-bottom: 25px; border: 1px solid #ddd; padding: 15px; border-radius: 5px; }}
+    .stat-row {{ display: flex; margin-bottom: 8px; }}
+    .stat-label {{ flex: 1; font-weight: bold; }}
+    .stat-value {{ flex: 1; text-align: right; }}
+    .good {{ color: green; }}
+    .average {{ color: orange; }}
+    .poor {{ color: red; }}
+    .meter {{ height: 10px; background-color: #eee; border-radius: 5px; margin-top: 5px; }}
+    .meter-fill {{ height: 100%; background-color: #4CAF50; border-radius: 5px; }}
+    .meter-fill.average {{ background-color: orange; }}
+    .meter-fill.poor {{ background-color: red; }}
+</style>
+</head>
+<body>
+<h1>Smart Cache Statistics</h1>
+<div class="stat-group">
+<h2>Cache Utilization</h2>
+    <div class="stat-row">
+        <div class="stat-label">Memory Cache:</div>
+        <div class="stat-value">{memory_size:,} / {memory_max:,} items ({memory_usage_pct:.1f}%)</div>
+    </div>
+    <div class="meter">
+        <div class="meter-fill" style="width: {min(memory_usage_pct, 100)}%;"></div>
+    </div>
+    <div class="stat-row">
+        <div class="stat-label">Disk Cache:</div>
+        <div class="stat-value">{disk_size:,} / {disk_max:,} items ({disk_usage_pct:.1f}%)</div>
+    </div>
+    <div class="meter">
+        <div class="meter-fill" style="width: {min(disk_usage_pct, 100)}%;"></div>
+    </div>
+</div>
+<div class="stat-group">
+<h2>Hit Rates</h2>
+    <div class="stat-row">
+        <div class="stat-label">Memory Hit Rate:</div>
+        <div class="stat-value {hit_rate_class(memory_hit_rate)}">{memory_hit_rate:.2f}%</div>
+    </div>
+    <div class="meter">
+        <div class="meter-fill {hit_rate_class(memory_hit_rate)}" style="width: {memory_hit_rate}%;"></div>
+    </div>
+    <div class="stat-row">
+        <div class="stat-label">Overall Hit Rate:</div>
+        <div class="stat-value {hit_rate_class(overall_hit_rate)}">{overall_hit_rate:.2f}%</div>
+    </div>
+    <div class="meter">
+        <div class="meter-fill {hit_rate_class(overall_hit_rate)}" style="width: {overall_hit_rate}%;"></div>
+    </div>
+</div>
+<div class="stat-group">
+<h2>Resource Savings</h2>
+    <div class="stat-row">
+        <div class="stat-label">API Calls Saved:</div>
+        <div class="stat-value">{api_calls_saved:,} calls</div>
+    </div>
+    <div class="stat-row">
+        <div class="stat-label">Computation Time Saved:</div>
+        <div class="stat-value">{time_saved_str}</div>
+    </div>
+    <div class="stat-row">
+        <div class="stat-label">Data Transfer Saved:</div>
+        <div class="stat-value">{data_saved_str}</div>
+    </div>
+</div>
+<div class="stat-group">
+<h2>Efficiency</h2>
+    <div class="stat-row">
+        <div class="stat-label">Cache Efficiency Score:</div>
+        <div class="stat-value {efficiency_class(calculate_cache_efficiency(stats))}">{calculate_cache_efficiency(stats):.1f}/10</div>
+    </div>
+    <div class="meter">
+        <div class="meter-fill {efficiency_class(calculate_cache_efficiency(stats))}" 
+             style="width: {calculate_cache_efficiency(stats)*10}%;"></div>
+    </div>
+</div>
+<p><small>Generated on {datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")}</small></p>
+</body>
+</html>
+"""
+    else:  # Default to text format
+        # Create a nicely formatted text report with boxes
+        width = 80
+
+        # Header
+        text = []
+        text.append("┌" + "─" * (width - 2) + "┐")
+        text.append("│" + "SMART CACHE STATISTICS".center(width - 2) + "│")
+        text.append("├" + "─" * (width - 2) + "┤")
+        
+        # Cache Utilization
+        text.append("│" + " Cache Utilization ".center(width - 2, "─") + "│")
+        text.append("│ Memory Cache: " + 
+                   f"{memory_size:,} / {memory_max:,} items ({memory_usage_pct:.1f}%)".ljust(width - 16) + "│")
+        text.append("│ Disk Cache:   " + 
+                   f"{disk_size:,} / {disk_max:,} items ({disk_usage_pct:.1f}%)".ljust(width - 16) + "│")
+        
+        # Hit Rates
+        text.append("│" + " Hit Rates ".center(width - 2, "─") + "│")
+        text.append("│ Memory Hit Rate: " + 
+                   f"{memory_hit_rate:.2f}% ({memory_hits:,} hits, {memory_misses:,} misses)".ljust(width - 20) + "│")
+        text.append("│ Disk Hit Rate:   " + 
+                   f"{disk_hit_rate:.2f}% ({disk_hits:,} hits, {disk_misses:,} misses)".ljust(width - 20) + "│")
+        text.append("│ Overall Hit Rate: " + 
+                   f"{overall_hit_rate:.2f}% ({overall_hits:,} total hits)".ljust(width - 21) + "│")
+        
+        # Cache Operations
+        text.append("│" + " Cache Operations ".center(width - 2, "─") + "│")
+        text.append("│ Memory Evictions: " + 
+                   f"{memory_evictions:,} items".ljust(width - 21) + "│")
+        text.append("│ Disk Evictions:   " + 
+                   f"{disk_evictions:,} items".ljust(width - 21) + "│")
+        
+        # Resource Savings
+        text.append("│" + " Resource Savings ".center(width - 2, "─") + "│")
+        text.append("│ API Calls Saved:       " + 
+                   f"{api_calls_saved:,} calls".ljust(width - 27) + "│")
+        text.append("│ Computation Time Saved: " + 
+                   f"{time_saved_str}".ljust(width - 28) + "│")
+        text.append("│ Data Transfer Saved:    " + 
+                   f"{data_saved_str}".ljust(width - 28) + "│")
+        
+        # Efficiency
+        text.append("│" + " Efficiency ".center(width - 2, "─") + "│")
+        text.append("│ Cache Efficiency Score: " + 
+                   f"{calculate_cache_efficiency(stats):.1f}/10".ljust(width - 28) + "│")
+        
+        # Footer
+        text.append("└" + "─" * (width - 2) + "┘")
+        
+        # Add interpretation of statistics
+        text.append("")
+        text.append(interpret_cache_stats(stats))
+        
+        return "\n".join(text)
+
+def calculate_cache_efficiency(stats):
+    """Calculate an overall cache efficiency score (0-10)."""
+    # Get hit rates
+    memory_hits = stats.get('memory_hits', 0)
+    memory_misses = stats.get('memory_misses', 0)
+    disk_hits = stats.get('disk_hits', 0)
+    disk_misses = stats.get('disk_misses', 0)
+
+    total_requests = memory_hits + memory_misses
+    memory_hit_rate = (memory_hits / total_requests) if total_requests > 0 else 0
+
+    overall_hits = memory_hits + disk_hits
+    overall_requests = total_requests + disk_misses  # Avoid double counting
+    overall_hit_rate = (overall_hits / overall_requests) if overall_requests > 0 else 0
+
+    # Get eviction rates
+    memory_evictions = stats.get('memory_evictions', 0)
+    eviction_rate = (memory_evictions / (memory_hits + 1)) if memory_hits > 0 else 1
+
+    # Calculate time and API call savings
+    api_calls_saved = stats.get('api_calls_saved', 0)
+    computation_time_saved = stats.get('computation_time_saved', 0)
+
+    # Compute the score (weighted combination)
+    hit_rate_score = overall_hit_rate * 6  # 0-6 points from hit rate
+    eviction_score = max(0, 2 - (eviction_rate * 2))  # 0-2 points from low eviction rate
+
+    # Additional points for API savings
+    api_score = min(2, api_calls_saved / 50)  # Up to 2 points for API savings
+
+    total_score = hit_rate_score + eviction_score + api_score
+    return min(10, total_score)  # Cap at 10
+
+def interpret_cache_stats(stats):
+    """Provide a human-readable interpretation of cache statistics."""
+    memory_hits = stats.get('memory_hits', 0)
+    memory_misses = stats.get('memory_misses', 0)
+    disk_hits = stats.get('disk_hits', 0)
+    disk_misses = stats.get('disk_misses', 0)
+
+    total_requests = memory_hits + memory_misses
+    memory_hit_rate = (memory_hits / total_requests) if total_requests > 0 else 0
+
+    overall_hits = memory_hits + disk_hits
+    overall_requests = total_requests + disk_misses  # Avoid double counting
+    overall_hit_rate = (overall_hits / overall_requests) if overall_requests > 0 else 0
+
+    api_calls_saved = stats.get('api_calls_saved', 0)
+    computation_time_saved = stats.get('computation_time_saved', 0)
+
+    # Generate interpretation
+    interpretation = "INTERPRETATION:\n"
+
+    if overall_hit_rate >= 0.8:
+        interpretation += "- The cache is performing extremely well with a high hit rate.\n"
+    elif overall_hit_rate >= 0.5:
+        interpretation += "- The cache is performing adequately but could be improved.\n"
+    else:
+        interpretation += "- The cache hit rate is low, indicating potential optimization opportunities.\n"
+
+    if memory_hit_rate > 0.8:
+        interpretation += "- Memory cache utilization is excellent, providing fast responses.\n"
+
+    if api_calls_saved > 0:
+        interpretation += f"- The cache has successfully saved {api_calls_saved} API calls, reducing costs and latency.\n"
+
+    if computation_time_saved > 1:
+        time_saved_str = format_time_duration(computation_time_saved)
+        interpretation += f"- {time_saved_str} of computation time has been saved through caching.\n"
+
+    # Add recommendations
+    interpretation += "\nRECOMMENDATIONS:\n"
+
+    if overall_hit_rate < 0.5:
+        interpretation += "- Consider increasing cache TTL values to improve hit rates.\n"
+        interpretation += "- Review cache key generation to ensure consistency.\n"
+
+    if memory_hit_rate < 0.3:
+        interpretation += "- Consider increasing memory cache size for better performance.\n"
+
+    memory_size = stats.get('memory_size', 0)
+    memory_max = stats.get('memory_max_size', 1)
+    memory_usage_pct = (memory_size / memory_max) if memory_max > 0 else 0
+
+    if memory_usage_pct > 0.9:
+        interpretation += "- Memory cache is nearly full. Consider increasing memory_size to reduce evictions.\n"
+
+    disk_size = stats.get('disk_size', 0)
+    disk_max = stats.get('disk_max_size', 1)
+    disk_usage_pct = (disk_size / disk_max) if disk_max > 0 else 0
+
+    if disk_usage_pct > 0.9:
+        interpretation += "- Disk cache is nearly full. Consider increasing disk_size or clearing infrequently accessed items.\n"
+
+    return interpretation
+
+def format_time_duration(seconds):
+    """Format time duration in a human-readable way."""
+    if seconds < 60:
+        return f"{seconds:.2f} seconds"
+    elif seconds < 3600:
+        minutes = seconds / 60
+        return f"{minutes:.2f} minutes"
+    elif seconds < 86400:
+        hours = seconds / 3600
+        return f"{hours:.2f} hours"
+    else:
+        days = seconds / 86400
+        return f"{days:.2f} days"
+
+def format_file_size(size_bytes):
+    """Format file size in a human-readable way."""
+    if size_bytes < 1024:
+        return f"{size_bytes} bytes"
+    elif size_bytes < 1024 * 1024:
+        kb = size_bytes / 1024
+        return f"{kb:.2f} KB"
+    elif size_bytes < 1024 * 1024 * 1024:
+        mb = size_bytes / (1024 * 1024)
+        return f"{mb:.2f} MB"
+    else:
+        gb = size_bytes / (1024 * 1024 * 1024)
+        return f"{gb:.2f} GB"
+
+def analyze_cache_performance(output_file=None):
+    """
+    Analyze cache performance and provide detailed recommendations.
+
+    Args:
+        output_file: Optional file to save analysis report
+    """
+    if not smart_cache_available:
+        print("Error: Smart cache is not available")
+        return
+        
+    try:
+        # Get cache statistics
+        stats = smart_cache.get_stats()
+        
+        # Analyze cache performance
+        memory_size = stats.get('memory_size', 0)
+        memory_max = stats.get('memory_max_size', 1)
+        memory_usage_pct = (memory_size / memory_max * 100) if memory_max > 0 else 0
+        
+        disk_size = stats.get('disk_size', 0)
+        disk_max = stats.get('disk_max_size', 1)
+        disk_usage_pct = (disk_size / disk_max * 100) if disk_max > 0 else 0
+        
+        memory_hits = stats.get('memory_hits', 0)
+        memory_misses = stats.get('memory_misses', 0)
+        disk_hits = stats.get('disk_hits', 0)
+        disk_misses = stats.get('disk_misses', 0)
+        
+        total_requests = memory_hits + memory_misses
+        memory_hit_rate = (memory_hits / total_requests * 100) if total_requests > 0 else 0
+        
+        overall_hits = memory_hits + disk_hits
+        overall_requests = total_requests + disk_misses  # Avoid double counting
+        overall_hit_rate = (overall_hits / overall_requests * 100) if overall_requests > 0 else 0
+        
+        memory_evictions = stats.get('memory_evictions', 0)
+        disk_evictions = stats.get('disk_evictions', 0)
+        
+        api_calls_saved = stats.get('api_calls_saved', 0)
+        computation_time_saved = stats.get('computation_time_saved', 0)
+        
+        # Generate analysis
+        analysis = []
+        analysis.append("## Cache Performance Analysis")
+        analysis.append(f"Generated on {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+        
+        analysis.append("### Current Performance Metrics")
+        analysis.append(f"- Memory Cache Usage: {memory_usage_pct:.1f}% ({memory_size:,}/{memory_max:,} items)")
+        analysis.append(f"- Disk Cache Usage: {disk_usage_pct:.1f}% ({disk_size:,}/{disk_max:,} items)")
+        analysis.append(f"- Overall Hit Rate: {overall_hit_rate:.2f}% ({overall_hits:,} hits from {overall_requests:,} requests)")
+        analysis.append(f"- Memory Hit Rate: {memory_hit_rate:.2f}% ({memory_hits:,} hits from {total_requests:,} memory requests)")
+        analysis.append(f"- API Calls Saved: {api_calls_saved:,}")
+        analysis.append(f"- Computation Time Saved: {format_time_duration(computation_time_saved)}")
+        
+        # Performance assessment
+        analysis.append("\n### Performance Assessment")
+        
+        if overall_hit_rate >= 80:
+            analysis.append("- **Excellent Hit Rate**: The cache is performing very well with a hit rate above 80%.")
+        elif overall_hit_rate >= 60:
+            analysis.append("- **Good Hit Rate**: The cache is performing well with a hit rate above 60%.")
+        elif overall_hit_rate >= 40:
+            analysis.append("- **Average Hit Rate**: The cache has a moderate hit rate that could be improved.")
+        else:
+            analysis.append("- **Poor Hit Rate**: The cache has a low hit rate, indicating potential issues.")
+        
+        if memory_hit_rate >= 70:
+            analysis.append("- **Efficient Memory Usage**: Memory cache is effectively serving requests.")
+        else:
+            analysis.append("- **Suboptimal Memory Usage**: Memory cache hit rate is lower than expected.")
+        
+        if memory_usage_pct >= 90:
+            analysis.append("- **Memory Cache Pressure**: Memory cache is nearly full, which may lead to increased evictions.")
+        elif memory_usage_pct <= 20:
+            analysis.append("- **Underutilized Memory Cache**: Memory cache has significant unused capacity.")
+        
+        if disk_usage_pct >= 90:
+            analysis.append("- **Disk Cache Pressure**: Disk cache is nearly full, which may lead to increased evictions.")
+        
+        if memory_evictions > memory_hits * 0.2:
+            analysis.append("- **High Eviction Rate**: Many items are being evicted before they can be reused.")
+        
+        # Efficiency estimation
+        efficiency_score = calculate_cache_efficiency(stats)
+        analysis.append(f"\n### Overall Efficiency Score: {efficiency_score:.1f}/10")
+        
+        if efficiency_score >= 8:
+            analysis.append("- **Excellent**: Cache is performing exceptionally well.")
+        elif efficiency_score >= 6:
+            analysis.append("- **Good**: Cache is performing well but has room for improvement.")
+        elif efficiency_score >= 4:
+            analysis.append("- **Average**: Cache is providing some benefit but could be significantly improved.")
+        else:
+            analysis.append("- **Poor**: Cache effectiveness is limited and needs optimization.")
+        
+        # Recommendations
+        analysis.append("\n### Recommendations")
+        
+        if overall_hit_rate < 50:
+            analysis.append("1. **Increase TTL Values**: Consider increasing the time-to-live for cached items to improve hit rates.")
+            analysis.append("   - Current hit rate suggests items may be expiring before they can be reused.")
+            analysis.append("   - Try increasing the TTL for embedding and API caches by 2-3x.")
+        
+        if memory_hit_rate < 40:
+            analysis.append("2. **Increase Memory Cache Size**: Consider increasing the memory cache size to keep more items in fast memory.")
+            analysis.append(f"   - Current memory cache limited to {memory_max:,} items, which may be insufficient.")
+            analysis.append(f"   - Recommended size: {int(memory_max * 1.5):,} items.")
+        
+        if memory_evictions > memory_hits * 0.2:
+            analysis.append("3. **Review Cache Key Generation**: High eviction rates suggest potential issues with cache key generation.")
+            analysis.append("   - Ensure consistent key generation for the same inputs.")
+            analysis.append("   - Check for unnecessary variation in cache keys.")
+        
+        if disk_usage_pct > 90:
+            analysis.append("4. **Increase Disk Cache Size or Clear Old Entries**: Disk cache is nearly full.")
+            analysis.append(f"   - Current disk cache limited to {disk_max:,} items.")
+            analysis.append(f"   - Recommended size: {int(disk_max * 1.5):,} items.")
+            analysis.append("   - Alternatively, run a cache cleanup to remove old entries.")
+        
+        if api_calls_saved < 10 and overall_requests > 100:
+            analysis.append("5. **Review API Caching Strategy**: Few API calls are being saved.")
+            analysis.append("   - Ensure API functions are properly decorated with @cached_api.")
+            analysis.append("   - Consider increasing API cache TTL for stable endpoints.")
+        
+        # Additional general recommendations
+        analysis.append("\n### General Optimization Tips")
+        analysis.append("- **Batch Similar Requests**: Group similar requests to improve cache efficiency.")
+        analysis.append("- **Normalize Inputs**: Standardize inputs before caching to increase hit rates.")
+        analysis.append("- **Preemptive Caching**: For predictable workflows, consider preloading the cache.")
+        analysis.append("- **Monitor Cache Growth**: Regularly check cache size and performance metrics.")
+        analysis.append("- **Adjust TTL Strategically**: Use longer TTL for stable data and shorter TTL for volatile data.")
+        
+        # Join analysis
+        report = "\n".join(analysis)
+        
+        # Output report
+        if output_file:
+            with open(output_file, 'w', encoding='utf-8') as f:
+                f.write(report)
+            print(f"Cache performance analysis saved to {output_file}")
+        else:
+            print(report)
+            
+    except Exception as e:
+        print(f"Error analyzing cache performance: {e}")
+        import traceback
+        print(traceback.format_exc())
+
 def analyze_translation_with_alignment(source_text, translation, use_groq=True, detailed=True, custom_weights=None, config_path=None, segment_type='sentence'):
     """
     Analyze translation with segment alignment detection.
@@ -538,9 +1953,9 @@ def analyze_translation_with_alignment(source_text, translation, use_groq=True, 
     if use_groq:
         try:
             from groq_client import GroqClient
-            from groq_evaluator import GroqEvaluator
+            from groq_evaluator import GroqTranslationEvaluator
             groq_client = GroqClient()
-            groq_evaluator = GroqEvaluator(client=groq_client)
+            groq_evaluator = GroqTranslationEvaluator(client=groq_client)
         except (ImportError, Exception) as e:
             logger.warning(f"Could not initialize Groq for demo: {e}")
             use_groq = False
@@ -582,9 +1997,9 @@ def compare_translations_with_alignment(source_text, translations, use_groq=True
     if use_groq:
         try:
             from groq_client import GroqClient
-            from groq_evaluator import GroqEvaluator
+            from groq_evaluator import GroqTranslationEvaluator
             groq_client = GroqClient()
-            groq_evaluator = GroqEvaluator(client=groq_client)
+            groq_evaluator = GroqTranslationEvaluator(client=groq_client)
         except (ImportError, Exception) as e:
             logger.warning(f"Could not initialize Groq for demo: {e}")
             use_groq = False
@@ -717,950 +2132,581 @@ def run_weight_demo(console):
     
     return 0
 
-def main():
-    """Main entry point for the CLI tool."""
-    # Set up argument parser
+async def async_main():
+    """Enhanced async main function for the translation evaluator."""
+    global performance_monitor
+    
+    start_time = time.time()
+    
+    # Parse arguments
     parser = setup_argparser()
     args = parser.parse_args()
     
-    # Create console for rich output early
-    console = Console(color_system="auto" if args.color == "auto" else 
-                      (True if args.color == "always" else False))
-
-    if args.run_alignment_demo:
-        return run_alignment_demo(console)
-
-    if args.run_weight_demo:
-        return run_weight_demo(console)
-
-    # Handle candidate-ranking shortcut early
-    if getattr(args, 'rank_candidates', False):
-        return rank_translations_cli(args)
-    
-    # Configure logging level
-    if args.debug:
-        logging.getLogger('tqa').setLevel(logging.DEBUG)
-    elif args.quiet:
-        logging.getLogger('tqa').setLevel(logging.ERROR)
-    
-    # Handle version display
-    if args.version:
-        show_version()
-        return 0
-    
-    # Initialize configuration
-    config = ConfigManager(config_path=args.config)
-    
-    # Override config with command line options
-    if args.api_key:
-        config.set_api_key("default", args.api_key)
-    if args.cache_dir:
-        config.set("cache.directory", args.cache_dir)
-    if args.no_cache:
-        config.set("models.embedding.use_cache", False)
-    if args.inference_mode:
-        config.set("inference_mode", args.inference_mode)
-    if args.embedding_model:
-        config.set("models.embedding.default", args.embedding_model)
-    if args.multilingual_model:
-        config.set("models.multilingual.type", args.multilingual_model)
-    
-    # Handle cache clearing
-    if args.clear_cache:
-        clear_all_cache(config)
-        return 0
-    
-    # Initialize base components
-    model_loader = ModelLoader(
-        config=config,
-        inference_mode=args.inference_mode or config.get("inference_mode", "hybrid")
+    # Initialize async evaluator
+    evaluator = AsyncTranslationEvaluator(
+        config_path=getattr(args, 'config', None),
+        interactive=getattr(args, 'interactive', False)
     )
     
-    # Initialize multilingual model manager
-    multilingual_model_manager = MultilingualModelManager(config, model_loader)
-    
-    # Initialize the text processor (required by the analyzer)
-    text_processor = TextProcessor()
-    
-    # Handle language listing - now uses MultilingualModelManager 
-    if args.list_languages:
-        # We've already defined a function for this
-        list_supported_languages()
-        return 0
-    
-    # Initialize the analyzer with all components explicitly
-    analyzer = TranslationQualityAnalyzer(
-        config=config,
-        model_loader=multilingual_model_manager,
-        text_processor=text_processor
-    )
-    
-    # Get input text
-    source_text = None
-    target_text = None
-    
-    # Interactive mode has the highest precedence
-    if args.interactive:
-        console.print(Panel(
-            "Enter the source text and translated text interactively.",
-            title="Interactive Mode",
-            border_style="cyan"
-        ))
-        
-        if args.translate:
-            # For translation, we only need source text and target language
-            source_text = get_interactive_input("Enter text to translate:")
-            if not args.target_lang:
-                args.target_lang = get_interactive_input("Enter target language code (e.g., es for Spanish):", multiline=False)
-        else:
-            source_text = get_interactive_input("Enter source text:")
-            if args.rate_translation:
-                # For rating, we need both texts
-                target_text = get_interactive_input("Enter translated text:")
-            elif not args.translate:
-                # Default mode needs both texts
-                target_text = get_interactive_input("Enter translated text:")
-    else:
-        # Command-line text has precedence over files
-        if args.source_text:
-            source_text = args.source_text
-        elif args.source_file:
-            try:
-                source_text = read_file_text(args.source_file)
-            except Exception as e:
-                console.print(f"[bold red]Error reading source file:[/bold red] {e}")
-                return 1
-        
-        if args.target_text:
-            target_text = args.target_text
-        elif args.target_file:
-            try:
-                target_text = read_file_text(args.target_file)
-            except Exception as e:
-                console.print(f"[bold red]Error reading target file:[/bold red] {e}")
-                return 1
-    
-    # Handle translation
-    if args.translate:
-        # Check if we have source text
-        if not source_text:
-            console.print("[bold red]Error:[/bold red] Source text is required for translation.")
-            console.print("[dim]Use --source-text or --source-file to provide input.[/dim]")
-            return 1
-            
-        # Check if we have target language
-        if not args.target_lang:
-            console.print("[bold red]Error:[/bold red] Target language is required for translation.")
-            console.print("[dim]Use --target-lang to specify the language to translate into.[/dim]")
-            return 1
-            
-        # Auto-detect source language if not provided
-        if not args.source_lang:
-            detection_result = analyzer.detect_language_advanced(source_text)
-            if isinstance(detection_result, dict):
-                args.source_lang = detection_result['language']
-                console.print(f"[yellow]Auto-detected source language:[/yellow] {args.source_lang}")
-            else:
-                args.source_lang = detection_result
-                console.print(f"[yellow]Auto-detected source language:[/yellow] {args.source_lang}")
-        
-        # Show translation status
-        console.print(Panel(
-            f"Translating from {args.source_lang} to {args.target_lang}...",
-            title="Translation In Progress",
-            border_style="yellow"
-        ))
-        
-        # Handle batch translation
-        if args.translate_batch:
-            # Split into lines and translate each
-            lines = source_text.strip().split('\n')
-            translations = []
-            
-            with Progress() as progress:
-                task = progress.add_task("[cyan]Translating...", total=len(lines))
-                
-                for line in lines:
-                    if line.strip():
-                        # Use the multilingual model manager to get the appropriate model
-                        translation = analyzer.translate_text(
-                            line.strip(),
-                            source_lang=args.source_lang,
-                            target_lang=args.target_lang,
-                            model_name=args.translation_model
-                        )
-                        translations.append(translation)
-                    else:
-                        translations.append("")
-                    progress.update(task, advance=1)
-            
-            # Join translations
-            result = "\n".join(translations)
-            
-            # Save to file if requested
-            if args.batch_output:
-                if write_to_file(args.batch_output, result):
-                    console.print(f"[green]Translations saved to:[/green] {args.batch_output}")
-                else:
-                    console.print(f"[red]Failed to save translations to:[/red] {args.batch_output}")
-            
-            # Display first few translations
-            table = Table(title=f"Batch Translation Results ({len(lines)} lines)")
-            table.add_column("Source", style="cyan", no_wrap=False)
-            table.add_column("Translation", style="green", no_wrap=False)
-            
-            # Show at most 5 examples
-            for i, (src, tgt) in enumerate(zip(lines[:5], translations[:5])):
-                # Truncate very long segments
-                src_display = (src[:80] + "...") if len(src) > 80 else src
-                tgt_display = (tgt[:80] + "...") if len(tgt) > 80 else tgt
-                table.add_row(src_display, tgt_display)
-                
-            console.print(table)
-            
-            if len(lines) > 5:
-                console.print(f"[dim]...and {len(lines) - 5} more lines[/dim]")
-        else:
-            # Single translation - use multilingual model manager to get the appropriate model
-            translation = analyzer.translate_text(
-                source_text,
-                source_lang=args.source_lang,
-                target_lang=args.target_lang,
-                model_name=args.translation_model
-            )
-            
-            # Display translation
-            panel = Panel(
-                translation,
-                title=f"Translation from {args.source_lang} to {args.target_lang}",
-                border_style="green"
-            )
-            console.print(panel)
-            
-            # Save to file if requested
-            if args.output:
-                if write_to_file(args.output, translation):
-                    console.print(f"[green]Translation saved to:[/green] {args.output}")
-                else:
-                    console.print(f"[red]Failed to save translation to:[/red] {args.output}")
-            
-            # Set as target text for possible rating
-            target_text = translation
-        
-        # After translation, if rate-translation is also specified, continue to rating
-        if not args.rate_translation:
+    try:
+        # Handle special commands first
+        if args.version:
+            show_version()
             return 0
-    
-    # Handle language detection
-    if args.detect_language:
-        # Check if we have input text
-        if not source_text and not args.source_text and not args.source_file:
-            # Prompt for text if none provided
-            source_text = get_interactive_input("Enter text to detect language:")
         
-        # Use source text for language detection if we have it
-        text_to_analyze = source_text if source_text else ""
+        if args.list_languages:
+            list_supported_languages()
+            return 0
         
-        # Perform language detection
-        detection_result = analyzer.detect_language_advanced(
-            text_to_analyze,
-            fast_mode=args.fast_detection,
-            detailed=args.verbose
-        )
+        if args.clear_cache:
+            clear_all_cache(evaluator.config)
+            return 0
         
-        # Create rich console for output
-        if isinstance(detection_result, dict):
-            # Detailed result
-            lang_code = detection_result['language']
-            confidence = detection_result['confidence'] * 100  # Convert to percentage
-            lang_name = detection_result.get('language_name', 'Unknown')
-            
-            # Color based on confidence
-            if confidence >= 85:
-                conf_color = "green"
-            elif confidence >= 60:
-                conf_color = "yellow"
+        # Handle async-specific commands
+        if args.demo:
+            await evaluator.initialize()
+            await evaluator.demo_translation_evaluation()
+            return 0
+        
+        if args.benchmark:
+            await evaluator.initialize()
+            return await run_benchmark(evaluator, args.benchmark_iterations, args.interactive)
+        
+        if args.batch_file:
+            await evaluator.initialize()
+            result = await evaluator.process_file(args.batch_file)
+            if result.get("status") == "error":
+                logger.error(f"Batch processing failed: {result.get('error')}")
+                return 1
+            console.print(f"Processed {result.get('items_processed')} items")
+            console.print(f"Results written to {result.get('output_path')}")
+            return 0
+        
+        if args.batch_directory:
+            await evaluator.initialize()
+            results = await evaluator.process_directory(args.batch_directory, args.file_pattern)
+            successful = sum(1 for r in results if r.get("status") == "success")
+            total = len(results)
+            console.print(f"Directory processing completed: {successful}/{total} files successful")
+            return 0 if successful == total else 1
+        
+        # Handle cache statistics (existing functionality)
+        if args.cache_stats and not any([
+            args.source_text, args.source_file, args.target_text, 
+            args.target_file, args.cache_analyze
+        ]):
+            return handle_cache_stats(args)
+        
+        if args.cache_analyze:
+            return handle_cache_analysis(args)
+        
+        # Check if required arguments are provided for translation analysis
+        if not (args.source_text or args.source_file):
+            if args.interactive:
+                source_text = get_interactive_input("Enter source text:")
             else:
-                conf_color = "red"
-            
-            # Basic panel with language info
-            panel_content = [
-                f"[bold]Detected Language:[/bold] {lang_name} ({lang_code})",
-                f"[bold]Confidence:[/bold] [{conf_color}]{confidence:.1f}%[/{conf_color}]",
-                f"[bold]Detection Method:[/bold] {detection_result['method'].capitalize()}"
-            ]
-            
-            # Add multilingual info if available
-            if detection_result.get('is_multilingual'):
-                panel_content.append("\n[bold]Multilingual Content Detected[/bold]")
-                
-                # Add composition details
-                if 'language_composition' in detection_result:
-                    composition = detection_result['language_composition']
-                    top_languages = sorted(composition.items(), key=lambda x: x[1], reverse=True)[:3]
-                    
-                    panel_content.append("[bold]Language Composition:[/bold]")
-                    for lang, percentage in top_languages:
-                        try:
-                            import pycountry
-                            lang_obj = pycountry.languages.get(alpha_2=lang)
-                            lang_name = lang_obj.name if lang_obj else lang
-                        except (AttributeError, KeyError, ImportError):
-                            lang_name = lang
-                            
-                        panel_content.append(f"  {lang_name}: {percentage*100:.1f}%")
-            
-            # Create and display the panel
-            panel = Panel(
-                "\n".join(panel_content),
-                title="Language Detection Results",
-                border_style=conf_color
-            )
-            console.print(panel)
-            
-            # Show detailed script information for verbose mode
-            if args.verbose and 'scripts' in detection_result:
-                scripts = detection_result['scripts']
-                
-                if scripts:
-                    # Create a table for scripts
-                    table = Table(title="Script Composition")
-                    table.add_column("Script", style="cyan")
-                    table.add_column("Proportion", style="magenta")
-                    
-                    # Add rows for each script (sorted by proportion)
-                    for script, prop in sorted(scripts.items(), key=lambda x: x[1], reverse=True):
-                        if prop > 0.01:  # Only show scripts with at least 1%
-                            table.add_row(
-                                script,
-                                f"{prop*100:.1f}%"
-                            )
-                    
-                    console.print(table)
-            
-            # Show all candidate languages for verbose mode
-            if args.verbose and 'all_scores' in detection_result:
-                scores = detection_result['all_scores']
-                
-                if len(scores) > 1:
-                    # Create a table for candidate languages
-                    table = Table(title="Language Candidates")
-                    table.add_column("Language", style="cyan")
-                    table.add_column("Score", style="magenta")
-                    
-                    # Add rows for each language (sorted by score)
-                    top_langs = sorted(scores.items(), key=lambda x: x[1], reverse=True)[:5]
-                    for lang, score in top_langs:
-                        try:
-                            import pycountry
-                            lang_obj = pycountry.languages.get(alpha_2=lang)
-                            lang_name = lang_obj.name if lang_obj else lang
-                        except (AttributeError, KeyError, ImportError):
-                            lang_name = lang
-                            
-                        table.add_row(
-                            f"{lang_name} ({lang})",
-                            f"{score*100:.1f}%"
-                        )
-                    
-                    console.print(table)
+                console.print("[bold red]Error:[/bold red] No source text provided. Use --source-text, --source-file, or --interactive.")
+                return 1
         else:
-            # Simple result (just language code)
-            try:
-                import pycountry
-                lang_obj = pycountry.languages.get(alpha_2=detection_result)
-                lang_name = lang_obj.name if lang_obj else "Unknown"
-            except (AttributeError, KeyError, ImportError):
-                lang_name = "Unknown"
-                
-            console.print(f"Detected language: {lang_name} ({detection_result})")
+            source_text = await read_source_text(args)
         
-        return 0
-        
-    # Handle text composition analysis
-    elif args.analyze_composition:
-        # Check if we have input text
-        if not source_text and not args.source_text and not args.source_file:
-            # Prompt for text if none provided
-            source_text = get_interactive_input("Enter text to analyze composition:")
-        
-        # Use source text for composition analysis
-        text_to_analyze = source_text if source_text else ""
-        
-        # Perform composition analysis
-        analysis = analyzer.analyze_text_composition(text_to_analyze)
-        
-        # Display main results
-        panel_content = [
-            f"[bold]Primary Language:[/bold] {analysis['primary_language']}",
-            f"[bold]Number of Languages:[/bold] {analysis['language_count']}",
-            f"[bold]Is Multilingual:[/bold] {'Yes' if analysis['is_multilingual'] else 'No'}"
-        ]
-        
-        panel = Panel(
-            "\n".join(panel_content),
-            title="Text Composition Analysis",
-            border_style="cyan"
-        )
-        console.print(panel)
-        
-        # Display language composition
-        if analysis['composition']:
-            # Create table for language composition
-            table = Table(title="Language Composition")
-            table.add_column("Language", style="cyan")
-            table.add_column("Percentage", style="magenta")
-            
-            # Add rows for each language
-            for lang, percentage in sorted(
-                analysis['composition'].items(), key=lambda x: x[1], reverse=True
-            ):
-                try:
-                    import pycountry
-                    lang_obj = pycountry.languages.get(alpha_2=lang)
-                    lang_name = lang_obj.name if lang_obj else lang
-                except (AttributeError, KeyError, ImportError):
-                    lang_name = lang
-                    
-                table.add_row(
-                    f"{lang_name} ({lang})",
-                    f"{percentage*100:.1f}%"
-                )
-            
-            console.print(table)
-            
-        # Display segments for verbose mode
-        if args.verbose and analysis['segments']:
-            console.print("\n[bold]Text Segments by Language:[/bold]\n")
-            
-            for i, segment in enumerate(analysis['segments']):
-                lang = segment['language']
-                try:
-                    import pycountry
-                    lang_obj = pycountry.languages.get(alpha_2=lang)
-                    lang_name = f"{lang_obj.name} ({lang})" if lang_obj else lang
-                except (AttributeError, KeyError, ImportError):
-                    lang_name = lang
-                    
-                # Color based on confidence
-                confidence = segment['confidence'] * 100
-                if confidence >= 85:
-                    color = "green"
-                elif confidence >= 60:
-                    color = "yellow"
-                else:
-                    color = "red"
-                    
-                # Display segment with its language
-                console.print(f"[{color}]Segment {i+1} - {lang_name} ({confidence:.1f}%):[/{color}]")
-                # Limit segment display to avoid overwhelming the console
-                text = segment['text']
-                if len(text) > 100:
-                    text = text[:97] + "..."
-                console.print(text)
-                console.print("")  # Empty line
-                
-        return 0
-    
-    # Handle translation rating
-    if args.rate_translation:
-        # Check if we have both texts
-        if not source_text or not target_text:
-            console.print("[bold red]Error:[/bold red] Both source and target texts are required for rating.")
-            return 1
-            
-        # Auto-detect languages if not provided
-        if not args.source_lang:
-            detection = analyzer.detect_language_advanced(source_text)
-            if isinstance(detection, dict):
-                args.source_lang = detection['language']
+        if not (args.target_text or args.target_file):
+            if args.interactive:
+                target_text = get_interactive_input("Enter target text:")
             else:
-                args.source_lang = detection
-            console.print(f"[yellow]Auto-detected source language:[/yellow] {args.source_lang}")
-            
-        if not args.target_lang:
-            detection = analyzer.detect_language_advanced(target_text)
-            if isinstance(detection, dict):
-                args.target_lang = detection['language']
-            else:
-                args.target_lang = detection
-            console.print(f"[yellow]Auto-detected target language:[/yellow] {args.target_lang}")
-        
-        # Rate the translation
-        console.print(Panel(
-            f"Rating translation quality from {args.source_lang} to {args.target_lang}...",
-            title="Translation Rating",
-            border_style="yellow"
-        ))
-        
-        # Perform quick rating
-        # Use multilingual_model_manager for language-specific models
-        rating = analyzer.analyze(
-            source_text,
-            target_text,
-            source_lang=args.source_lang,
-            target_lang=args.target_lang
-        )
-        
-        # Display rating results
-        score = rating.quality_score * 100  # Convert to percentage
-        
-        # Color based on score
-        if score >= 80:
-            color = "green"
-        elif score >= 60:
-            color = "yellow"
+                console.print("[bold red]Error:[/bold red] No target text provided. Use --target-text, --target-file, or --interactive.")
+                return 1
         else:
-            color = "red"
-            
-        # Create rating panel
-        panel_content = [
-            f"[bold]Overall Rating:[/bold] [bold {color}]{score:.1f}%[/bold {color}]",
-        ]
+            target_text = await read_target_text(args)
         
-        # Add subscores if available
-        if rating.fluency_score:
-            fluency = rating.fluency_score * 100
-            fluency_color = "green" if fluency >= 80 else "yellow" if fluency >= 60 else "red"
-            panel_content.append(f"[bold]Fluency:[/bold] [{fluency_color}]{fluency:.1f}%[/{fluency_color}]")
-            
-        if rating.accuracy_score:
-            accuracy = rating.accuracy_score * 100
-            accuracy_color = "green" if accuracy >= 80 else "yellow" if accuracy >= 60 else "red"
-            panel_content.append(f"[bold]Accuracy:[/bold] [{accuracy_color}]{accuracy:.1f}%[/{accuracy_color}]")
-            
-        if rating.detailed_feedback:
-            panel_content.append(f"\n[bold]Feedback:[/bold] {rating.detailed_feedback}")
+        # Get language codes
+        source_lang = args.source_lang or 'en'
+        target_lang = args.target_lang or 'es'
         
-        panel = Panel(
-            "\n".join(panel_content),
-            title="Translation Rating Results",
-            border_style=color
-        )
+        if args.interactive and (not args.source_lang or not args.target_lang):
+            if not args.source_lang:
+                source_lang = Prompt.ask("Enter source language code", default="en")
+            if not args.target_lang:
+                target_lang = Prompt.ask("Enter target language code", default="es")
         
-        console.print(panel)
+        # Initialize evaluator and run analysis
+        await evaluator.initialize()
         
-        return 0
-    
-    # Check if we have required input for analysis
-    if not source_text or not target_text:
-        # If either text is missing and we're not in a special mode, show error
-        if source_text and not target_text:
-            console.print("[bold yellow]Warning:[/bold yellow] Target text is missing. Please provide translated text.")
-        elif not source_text and target_text:
-            console.print("[bold yellow]Warning:[/bold yellow] Source text is missing. Please provide source text.")
-        else:
-            # Both missing, but we might be in a special mode
-            if not args.detect_language and not args.analyze_composition:
-                console.print("[bold red]Error:[/bold red] Both source and target texts are required.")
-                console.print("[dim]Use --source-text/--target-text or --source-file/--target-file to provide input.[/dim]")
-                console.print("[dim]Or use --interactive for guided input.[/dim]")
-        
-        # Show command line help
-        console.print("\n[bold cyan]Command-line arguments:[/bold cyan]")
-        parser.print_help()
-        return 1
-    
-    # Perform analysis based on selected mode
-    if args.similarity:
-        # Perform semantic similarity analysis
-        # Use MultilingualModelManager for language-specific models
-        results = analyzer.analyze_semantic_similarity(
-            source_text,
-            target_text,
-            metric=args.metric,
-            source_lang=args.source_lang,
-            target_lang=args.target_lang,
-            segmented=args.segmented,
-            classification=args.classify
-        )
-        
-        # Overall similarity panel
-        avg_similarity = results["average_similarity"] * 100
-        source_lang = results["source_language"]
-        target_lang = results["target_language"]
-        
-        # Color code based on similarity
-        if avg_similarity >= 80:
-            color = "green"
-        elif avg_similarity >= 60:
-            color = "yellow"
-        else:
-            color = "red"
-        
-        # Include classification if requested
-        classification_info = ""
-        if args.classify and "overall_match_class" in results:
-            match_class = results["overall_match_class"]
-            classification_info = f"\nMatch class: [bold]{match_class.upper()}[/bold]"
-        
-        panel = Panel(
-            f"[bold]Semantic Similarity:[/bold] [bold {color}]{avg_similarity:.1f}%[/bold {color}]\n"
-            f"Source language: {source_lang}\n"
-            f"Target language: {target_lang}\n"
-            f"Metric: {results['metric']}"
-            f"{classification_info}",
-            title="Similarity Analysis Results",
-            border_style=color
-        )
-        
-        console.print(panel)
-        
-        # Display segment analysis if verbose or multi-segment
-        if (args.verbose or len(results["segment_analysis"]) > 1) and not args.segmented:
-            # Create table for segment comparison
-            table = Table(title="Segment-by-Segment Comparison", box=Box.ROUNDED)
-            table.add_column("Source", style="cyan", no_wrap=False)
-            table.add_column("Target", style="green", no_wrap=False)
-            table.add_column("Similarity", style="magenta")
-            
-            if args.classify:
-                table.add_column("Match", style="yellow")
-                
-            # Add rows for segments (limit to top 10 if there are many)
-            segments_to_show = results["segment_analysis"]
-            if len(segments_to_show) > 10 and not args.verbose:
-                console.print(f"[yellow]Showing 10 of {len(segments_to_show)} segments. Use --verbose to see all.[/yellow]")
-                segments_to_show = segments_to_show[:10]
-                
-            for segment in segments_to_show:
-                # Truncate very long segments for display
-                source_display = (segment["source"][:80] + "...") if len(segment["source"]) > 80 else segment["source"]
-                target_display = (segment["target"][:80] + "...") if len(segment["target"]) > 80 else segment["target"]
-                
-                sim_value = segment["similarity"] * 100
-                sim_color = "green" if sim_value >= 80 else "yellow" if sim_value >= 60 else "red"
-                similarity_cell = f"[{sim_color}]{sim_value:.1f}%[/{sim_color}]"
-                
-                if args.classify and "match_class" in segment:
-                    table.add_row(
-                        source_display, 
-                        target_display,
-                        similarity_cell,
-                        segment["match_class"].upper()
-                    )
-                else:
-                    table.add_row(
-                        source_display, 
-                        target_display,
-                        similarity_cell
-                    )
-            
-            console.print(table)
-            
-        # Display performance info
-        if "analysis_time" in results:
-            console.print(f"[dim]Analysis completed in {results['analysis_time']:.2f} seconds[/dim]")
-    
-    elif args.cross_lingual:
-        # Perform cross-lingual analysis
-        # Use MultilingualModelManager for language-specific models
-        results = analyzer.analyze_cross_lingual_similarity(
-            source_text,
-            target_text,
-            source_lang=args.source_lang,
-            target_lang=args.target_lang,
-            similarity_metric=args.metric,
-            preprocessing_level=args.preprocessing,
-            detailed=args.verbose
-        )
-        
-        # Basic results panel
-        avg_similarity = results["average_similarity"] * 100
-        source_lang = results["source_language"]
-        target_lang = results["target_language"]
-        
-        # Color code based on similarity
-        if avg_similarity >= 80:
-            color = "green"
-        elif avg_similarity >= 60:
-            color = "yellow"
-        else:
-            color = "red"
-        
-        panel = Panel(
-            f"[bold]Cross-lingual Similarity:[/bold] [bold {color}]{avg_similarity:.1f}%[/bold {color}]\n"
-            f"Source language: {source_lang}\n"
-            f"Target language: {target_lang}\n"
-            f"Metric: {results['metric']}",
-            title="Translation Analysis Results",
-            border_style=color
-        )
-        
-        console.print(panel)
-        
-        # Detailed results if verbose
-        if args.verbose and "alignment_confidence" in results:
-            confidence = results["alignment_confidence"] * 100
-            
-            detail_panel = Panel(
-                f"[bold]Alignment confidence:[/bold] {confidence:.1f}%\n"
-                f"Number of mutual best matches: {len(results['mutual_best_matches'])}\n"
-                f"Total segments analyzed: {len(results['similarity_scores'])}",
-                title="Detailed Analysis",
-                border_style="cyan"
-            )
-            
-            console.print(detail_panel)
-            
-            # Display a heatmap visualization of the similarity matrix if not too large
-            if len(results["similarity_scores"]) <= 20 and "similarity_matrix" in results:
-                console.print("[bold]Similarity Matrix:[/bold]")
-                matrix = results["similarity_matrix"]
-                
-                # Create a simple ASCII heatmap
-                for row in matrix:
-                    cells = []
-                    for val in row:
-                        # Convert similarity to a color intensity
-                        intensity = min(int(val * 9), 8)  # 0-8 scale
-                        cells.append(f"[color(231)][[/color(231)][color({232+intensity*3})]{'█' * intensity}[/color({232+intensity*3})][color(231)]][/color(231)]")
-                    console.print(" ".join(cells))
-    
-    else:
-        if hasattr(args, 'weak_alignment') and args.weak_alignment:
-            # Perform composite analysis with optional weak alignment detection
-            use_groq_flag = (True if args.use_groq is None else args.use_groq)
-            results = analyze_translation_with_alignment(
-                source_text=source_text,
-                translation=target_text,
-                use_groq=use_groq_flag,
-                detailed=args.detailed_report,
-                segment_type=args.segment_type,
-                config_path=args.config
-            )
-            composite = results.get('composite_score', 0) * 100
-            # Colour based on composite score
-            if composite >= 80:
-                color = "green"
-            elif composite >= 60:
-                color = "yellow"
-            else:
-                color = "red"
-            panel_lines = [
-                f"[bold]Composite Quality Score:[/bold] [bold {color}]{composite:.1f}%[/bold {color}]"
-            ]
-            # If alignment summary available, show its headline
-            alignment = results.get('alignment_analysis', {})
-            summary = alignment.get('enhanced_summary') or alignment.get('weak_alignment_summary') or {}
-            if summary:
-                sev = summary.get('severity_level', 'n/a').upper()
-                finding = summary.get('main_finding', 'No summary')
-                panel_lines.append(f"[bold]Alignment Severity:[/bold] {sev}")
-                panel_lines.append(f"[bold]Key Finding:[/bold] {finding}")
-            panel = Panel("\n".join(panel_lines), title="Translation Quality & Alignment", border_style=color)
-            console.print(panel)
-        else:
-            # Default to standard translation quality analysis
-            # Use MultilingualModelManager for language-specific models
-            results = analyzer.analyze(
+        with console.status("[bold green]Running translation analysis..."):
+            results = await evaluator.analyze_translation(
                 source_text,
                 target_text,
-                source_lang=args.source_lang,
-                target_lang=args.target_lang,
-                detailed=args.detailed_report
+                source_lang,
+                target_lang,
+                include_error_analysis=getattr(args, 'detailed_report', False)
             )
-            
-            # Display results
-            quality_score = results.quality_score * 100  # Convert to percentage
-            
-            # Color based on quality score
-            if quality_score >= 80:
-                color = "green"
-            elif quality_score >= 60:
-                color = "yellow"
-            else:
-                color = "red"
-            
-            panel = Panel(
-                f"[bold]Translation Quality Score:[/bold] [bold {color}]{quality_score:.1f}%[/bold {color}]\n"
-                f"Source language: {results.source_lang}\n"
-                f"Target language: {results.target_lang}\n"
-                f"Fluency score: {results.fluency_score*100:.1f}%\n"
-                f"Adequacy score: {results.accuracy_score*100:.1f}%",
-                title="Translation Quality Analysis",
-                border_style=color
-            )
-            
-            console.print(panel)
-            
-            # Show detailed report if requested
-            if args.detailed_report and hasattr(results, "segment_scores"):
-                # Create table for segment scores
-                table = Table(title="Segment Quality Scores")
-                table.add_column("Source", style="cyan", no_wrap=False)
-                table.add_column("Translation", style="green", no_wrap=False)
-                table.add_column("Quality", style="magenta")
-                
-                # Add rows for segments (limit to 10 if there are many)
-                segments = results.segment_scores
-                if len(segments) > 10 and not args.verbose:
-                    console.print(f"[yellow]Showing 10 of {len(segments)} segments. Use --verbose to see all.[/yellow]")
-                    segments = segments[:10]
-                    
-                for segment in segments:
-                    # Truncate very long segments for display
-                    source = (segment.source[:80] + "...") if len(segment.source) > 80 else segment.source
-                    target = (segment.target[:80] + "...") if len(segment.target) > 80 else segment.target
-                    score = segment.score * 100
-                    
-                    # Color code based on score
-                    score_color = "green" if score >= 80 else "yellow" if score >= 60 else "red"
-                    
-                    table.add_row(
-                        source,
-                        target,
-                        f"[{score_color}]{score:.1f}%[/{score_color}]"
-                    )
-                    
-                console.print(table)
+        
+        # Generate and output report
+        report = generate_report(results, args.format)
+        
+        if args.output:
+            await write_output_file(args.output, report)
+            if not args.quiet:
+                console.print(f"[green]Analysis report saved to {args.output}[/green]")
+        else:
+            console.print(report)
+        
+        # Show performance summary if monitoring enabled
+        if args.monitor or args.performance_report:
+            show_performance_summary(evaluator)
+        
+        return 0
+        
+    except KeyboardInterrupt:
+        logger.info("Operation interrupted by user")
+        return 1
+    except Exception as e:
+        logger.error(f"Unhandled exception: {str(e)}", exc_info=True)
+        console.print(f"[bold red]Error:[/bold red] {str(e)}")
+        if args.verbose:
+            console.print(Panel(traceback.format_exc(), title="Error Details", border_style="red"))
+        return 1
+    finally:
+        await evaluator.close()
+
+
+async def read_source_text(args) -> str:
+    """Read source text from file or argument."""
+    if args.source_text:
+        return args.source_text
+    
+    if HAS_ASYNC_LIBS:
+        async with aiofiles.open(args.source_file, 'r', encoding='utf-8') as f:
+            return await f.read()
+    else:
+        return Path(args.source_file).read_text(encoding='utf-8')
+
+
+async def read_target_text(args) -> str:
+    """Read target text from file or argument."""
+    if args.target_text:
+        return args.target_text
+    
+    if HAS_ASYNC_LIBS:
+        async with aiofiles.open(args.target_file, 'r', encoding='utf-8') as f:
+            return await f.read()
+    else:
+        return Path(args.target_file).read_text(encoding='utf-8')
+
+
+async def write_output_file(file_path: str, content: str) -> None:
+    """Write content to output file."""
+    if HAS_ASYNC_LIBS:
+        async with aiofiles.open(file_path, 'w', encoding='utf-8') as f:
+            await f.write(content)
+    else:
+        Path(file_path).write_text(content, encoding='utf-8')
+
+
+def generate_report(results: Dict[str, Any], format_type: str) -> str:
+    """Generate a report from analysis results."""
+    if format_type == 'json':
+        return json.dumps(results, indent=2, default=str)
+    elif format_type == 'html':
+        return output_html(results, "Translation Analysis Report")
+    elif format_type == 'markdown':
+        return generate_markdown_report(results)
+    else:  # text format
+        return generate_text_report(results)
+
+
+def generate_markdown_report(results: Dict[str, Any]) -> str:
+    """Generate a markdown report from results."""
+    report = "# Translation Analysis Report\n\n"
+    
+    if 'source_text' in results:
+        report += f"**Source Text:** {results['source_text']}\n\n"
+    if 'translated_text' in results:
+        report += f"**Translation:** {results['translated_text']}\n\n"
+    
+    report += "## Scores\n\n"
+    if 'embedding_similarity' in results:
+        report += f"- **Embedding Similarity:** {results['embedding_similarity']:.4f}\n"
+    if 'groq_quality_score' in results:
+        report += f"- **Groq Quality Score:** {results['groq_quality_score']:.2f}/10\n"
+    if 'combined_score' in results:
+        report += f"- **Combined Score:** {results['combined_score']:.4f}\n"
+    
+    # Add Groq analysis if available
+    if 'groq_analysis' in results:
+        analysis = results['groq_analysis']
+        report += "\n## Detailed Analysis\n\n"
+        if analysis.get('analysis'):
+            report += f"{analysis['analysis']}\n\n"
+        
+        if analysis.get('strengths'):
+            report += "### Strengths\n"
+            for strength in analysis['strengths']:
+                report += f"- {strength}\n"
+            report += "\n"
+        
+        if analysis.get('weaknesses'):
+            report += "### Areas for Improvement\n"
+            for weakness in analysis['weaknesses']:
+                report += f"- {weakness}\n"
+            report += "\n"
+    
+    return report
+
+
+def generate_text_report(results: Dict[str, Any]) -> str:
+    """Generate a text report from results."""
+    report = "Translation Analysis Report\n"
+    report += "=" * 30 + "\n\n"
+    
+    if 'embedding_similarity' in results:
+        report += f"Embedding Similarity: {results['embedding_similarity']:.4f}\n"
+    if 'groq_quality_score' in results:
+        report += f"Groq Quality Score: {results['groq_quality_score']:.2f}/10\n"
+    if 'combined_score' in results:
+        report += f"Combined Score: {results['combined_score']:.4f}\n"
+    
+    return report
+
+
+async def run_benchmark(evaluator, iterations: int, interactive: bool) -> int:
+    """Run performance benchmark."""
+    sample_data = [
+        {
+            "source_text": "The quick brown fox jumps over the lazy dog.",
+            "translated_text": "El zorro marrón rápido salta sobre el perro perezoso.",
+            "source_lang": "en",
+            "target_lang": "es"
+        }
+    ] * iterations
+    
+    if interactive:
+        console.print(f"[bold]Running benchmark with {iterations} iterations...[/bold]")
+    
+    start_time = time.time()
+    
+    # Run benchmark
+    results = []
+    for item in sample_data:
+        result = await evaluator.analyze_translation(
+            item["source_text"],
+            item["translated_text"], 
+            item["source_lang"],
+            item["target_lang"]
+        )
+        results.append(result)
+    
+    end_time = time.time()
+    duration = end_time - start_time
+    successful = sum(1 for r in results if "error" not in r)
+    
+    # Display results
+    benchmark_results = {
+        "total_items": len(sample_data),
+        "successful": successful,
+        "failed": len(results) - successful,
+        "total_time_seconds": duration,
+        "items_per_second": len(sample_data) / duration,
+        "avg_time_per_item_seconds": duration / len(sample_data)
+    }
+    
+    if interactive:
+        bench_table = Table(show_header=True, header_style="bold")
+        bench_table.add_column("Metric")
+        bench_table.add_column("Value")
+        
+        bench_table.add_row("Total Items", str(benchmark_results["total_items"]))
+        bench_table.add_row("Successful", str(benchmark_results["successful"]))
+        bench_table.add_row("Failed", str(benchmark_results["failed"]))
+        bench_table.add_row("Total Time", f"{benchmark_results['total_time_seconds']:.3f} seconds")
+        bench_table.add_row("Items/Second", f"{benchmark_results['items_per_second']:.2f}")
+        bench_table.add_row("Avg Time/Item", f"{benchmark_results['avg_time_per_item_seconds']:.4f} seconds")
+        
+        console.print("\n[bold]Benchmark Results:[/bold]")
+        console.print(bench_table)
+    else:
+        print(json.dumps(benchmark_results, indent=2))
     
     return 0
 
+
+def handle_cache_stats(args) -> int:
+    """Handle cache statistics display."""
+    if not smart_cache_available:
+        console.print("[bold red]Error:[/bold red] Smart cache is not available in this installation.")
+        return 1
+    
+    try:
+        cache_stats = smart_cache.get_stats()
+        formatted_stats = format_cache_stats(cache_stats, args.cache_stats_format)
+        
+        if args.cache_stats_output:
+            with open(args.cache_stats_output, 'w', encoding='utf-8') as f:
+                f.write(formatted_stats)
+            console.print(f"Cache statistics saved to {args.cache_stats_output}")
+        else:
+            console.print(formatted_stats)
+        
+        return 0
+    except Exception as e:
+        console.print(f"[bold red]Error getting cache statistics:[/bold red] {e}")
+        return 1
+
+
+def handle_cache_analysis(args) -> int:
+    """Handle cache performance analysis."""
+    if not smart_cache_available:
+        console.print("[bold red]Error:[/bold red] Smart cache is not available in this installation.")
+        return 1
+    
+    try:
+        analyze_cache_performance(args.cache_stats_output)
+        return 0
+    except Exception as e:
+        console.print(f"[bold red]Error analyzing cache performance:[/bold red] {e}")
+        return 1
+
+
+def show_performance_summary(evaluator):
+    """Show performance summary if available."""
+    if evaluator.perf_data:
+        console.print("\n[bold]Performance Summary:[/bold]")
+        for operation, data in evaluator.perf_data.items():
+            console.print(f"- {operation}: {data['count']} calls, avg {data['avg_time']:.3f}s")
+
+
+def main():
+    """Entry point that sets up and runs the async event loop."""
+    try:
+        # Get or create event loop
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+        
+        # Setup signal handlers for graceful shutdown
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            loop.add_signal_handler(sig, lambda s=sig: asyncio.create_task(
+                shutdown(loop, sig)
+            ))
+        
+        # Run async_main and get exit code
+        exit_code = loop.run_until_complete(async_main())
+        
+        # Exit with the returned code
+        sys.exit(exit_code)
+        
+    except KeyboardInterrupt:
+        logger.info("Operation interrupted by user")
+        sys.exit(1)
+    except Exception as e:
+        logger.error(f"Unhandled exception: {str(e)}", exc_info=True)
+        sys.exit(1)
+
+
+async def shutdown(loop, signal=None):
+    """Cleanup tasks tied to the service's shutdown."""
+    if signal:
+        logger.info(f"Received exit signal {signal.name}")
+    
+    logger.info("Cleaning up resources...")
+    
+    # Wait 1 second to give tasks a chance to complete
+    await asyncio.sleep(1)
+    
+    # Cancel all tasks
+    tasks = [t for t in asyncio.all_tasks() if t is not asyncio.current_task()]
+    
+    for task in tasks:
+        task.cancel()
+    
+    logger.info(f"Cancelling {len(tasks)} outstanding tasks")
+    await asyncio.gather(*tasks, return_exceptions=True)
+    
+    loop.stop()
+
 # -----------------------------------------------------------------------------
-# Candidate ranking helpers (stand-alone to keep existing logic untouched)
+# Candidate ranking CLI helper (lightweight – used by unit tests)
 # -----------------------------------------------------------------------------
-
-
-def _read_text_file(path: str) -> str:
-    with open(path, 'r', encoding='utf-8') as fh:
-        return fh.read().strip()
-
-
-def _read_candidates_file(path: str) -> List[str]:
-    with open(path, 'r', encoding='utf-8') as fh:
-        return [line.strip() for line in fh if line.strip()]
-
-
-def _print_table(ranked: List[Dict[str, Any]], source: Optional[str] = None, diagnostics: Optional[Dict[str, Any]] = None) -> None:
-    from tabulate import tabulate  # local import to keep fast startup
-
-    headers = ["Rank", "Similarity", "Confidence", "Translation"]
-    rows = [
-        [i + 1, f"{item['similarity']:.4f}", f"{item['confidence']:.4f}", item['translation' if 'translation' in item else 'text']]  # type: ignore
-        for i, item in enumerate(ranked)
-    ]
-    if source:
-        print(f"Source: {source}\n")
-    print(tabulate(rows, headers=headers, tablefmt="grid"))
-
-    # Diagnostics summary
-    if diagnostics:
-        print("\n=== Clustering Diagnostics ===")
-        print(f"Optimal clusters: {diagnostics.get('optimal_clusters')}")
-        print(f"Cluster sizes: {diagnostics.get('cluster_sizes')}")
-        print(f"Within-cluster cohesion: {diagnostics.get('cluster_cohesion'):.4f}")
-        print(f"Between-cluster separation: {diagnostics.get('cluster_separation'):.4f}")
-        print(f"Variance explained: {diagnostics.get('variance_explained'):.4f}")
-
-def _output_json(result: Dict[str, Any], source: Optional[str]) -> str:
-    import json
-
-    payload = {"source_text": source or "", **result}
-    return json.dumps(payload, indent=2, ensure_ascii=False)
-
-def _output_csv(result: Dict[str, Any], source: Optional[str]) -> str:
-    import csv
-    from io import StringIO
-
-    ranked = result.get("ranked_translations", [])
-    diagnostics = result.get("diagnostics")
-
-    buf = StringIO()
-    writer = csv.writer(buf)
-    writer.writerow(["Rank", "Similarity", "Confidence", "Translation"])
-    if source:
-        writer.writerow(["# Source", source])
-        writer.writerow([])
-    for idx, item in enumerate(ranked):
-        writer.writerow([idx + 1, f"{item['similarity']:.4f}", f"{item['confidence']:.4f}", item['translation' if 'translation' in item else 'text']])  # type: ignore
-
-    if diagnostics:
-        writer.writerow([])
-        writer.writerow(["# Clustering Diagnostics"])
-        writer.writerow(["Optimal clusters", diagnostics.get('optimal_clusters')])
-        writer.writerow(["Cluster sizes", diagnostics.get('cluster_sizes')])
-        writer.writerow(["Within-cluster cohesion", f"{diagnostics.get('cluster_cohesion'):.4f}"])
-        writer.writerow(["Between-cluster separation", f"{diagnostics.get('cluster_separation'):.4f}"])
-        writer.writerow(["Variance explained", f"{diagnostics.get('variance_explained'):.4f}"])
-
-    return buf.getvalue()
-
-def _output_yaml(result: Dict[str, Any], source: Optional[str]) -> str:
-    payload = {"source_text": source or "", **result}
-    return yaml.dump(payload, sort_keys=False, allow_unicode=True)
-
-def _output_html(result: Dict[str, Any], source: Optional[str], include_diag: bool) -> str:
-    payload = {"source_text": source or "", **result}
-    return output_html(payload, include_diagnostics=include_diag)
 
 def rank_translations_cli(args) -> int:
-    """Standalone CLI handler for --rank-candidates."""
-    # Source text
-    if args.source_file:
-        try:
-            source_text = _read_text_file(args.source_file)
-        except FileNotFoundError:
-            print(f"[ERROR] Source file not found: {args.source_file}")
-            return 1
-    elif args.source_text:
-        source_text = args.source_text
-    else:
-        print("[ERROR] Source text is required (use --source-text or --source-file).")
-        return 1
+    """Light-weight wrapper around ``calculate_translation_confidence`` used by the
+    unit tests in *tests/test_cli.py*.
 
-    # Candidate list
-    candidates: List[str] = []
-    if args.candidates_file:
-        try:
-            candidates.extend(_read_candidates_file(args.candidates_file))
-        except FileNotFoundError:
-            print(f"[ERROR] Candidates file not found: {args.candidates_file}")
-            return 1
-    if args.candidates:
-        candidates.extend([c.strip() for c in args.candidates.split(',') if c.strip()])
+    The function expects an *args* object (e.g. an ``argparse.Namespace``) to
+    expose the following attributes (defaults mimic the test-fixture):
+        source_text            – direct source string, or
+        source_file            – path to text file with the source string
+        candidates             – comma-separated candidate translations, or
+        candidates_file        – path to a file containing one candidate per line
+        model                  – name of sentence-embedding model (optional)
+        confidence_method      – distribution | gap | range
+        output_format          – json | yaml | csv | table | html
+        include_diagnostics    – boolean flag
+        output_file            – optional path to write the results
 
-    if not candidates:
-        print("[ERROR] No candidate translations provided (use --candidates or --candidates-file).")
-        return 1
+    On success the function prints the requested representation (unless writing
+    to *output_file*) and returns **0**. Any error is printed to *stderr* and the
+    function returns **1** so that the calling test can handle a non-zero exit
+    code if desired.
+    """
+    import json
+    import sys
+    from pathlib import Path
+    # Optional dependency only required for YAML output
+    try:
+        import yaml  # type: ignore
+        _HAS_YAML = True
+    except Exception:
+        _HAS_YAML = False
 
-    result = calculate_translation_confidence(
-        source_text,
-        candidates,
-        model_name=args.model,
-        confidence_method=args.confidence_method,
-        include_diagnostics=args.include_diagnostics,
-    )
-
-    ranked = result["ranked_translations"]
-
-    fmt = args.output_format.lower()
-    if fmt == "json":
-        content = _output_json(result, source_text)
-    elif fmt == "yaml":
-        content = _output_yaml(result, source_text)
-    elif fmt == "csv":
-        content = _output_csv(result, source_text)
-    elif fmt == "html":
-        content = _output_html(result, source_text, args.include_diagnostics)
-    else:
-        _print_table(ranked, source_text, result.get("diagnostics") if args.include_diagnostics else None)
-        content = None
-
-    # Save or print
-    if content is not None:
-        if args.output_file:
-            try:
-                with open(args.output_file, "w", encoding="utf-8") as fh:
-                    fh.write(content)
-                print(f"Results written to {args.output_file}")
-            except Exception as exc:
-                print(f"[ERROR] Could not write to {args.output_file}: {exc}")
+    # ------------------------------------------------------------------
+    # Resolve source text
+    # ------------------------------------------------------------------
+    try:
+        if getattr(args, "source_text", None):
+            source_text = str(args.source_text).strip()
+        elif getattr(args, "source_file", None):
+            source_path = Path(args.source_file)
+            if not source_path.exists():
+                print(f"Error: source file not found – {source_path}", file=sys.stderr)
                 return 1
+            source_text = source_path.read_text(encoding="utf-8", errors="replace").strip()
         else:
-            print(content)
+            print("Error: either --source-text or --source-file must be provided.", file=sys.stderr)
+            return 1
+    except Exception as exc:
+        print(f"Error reading source text: {exc}", file=sys.stderr)
+        return 1
 
-    return 0
+    # ------------------------------------------------------------------
+    # Resolve candidate translations
+    # ------------------------------------------------------------------
+    candidates: list[str] = []
+    try:
+        if getattr(args, "candidates_file", None):
+            cand_path = Path(args.candidates_file)
+            if not cand_path.exists():
+                print(f"Error: candidates file not found – {cand_path}", file=sys.stderr)
+                return 1
+            with cand_path.open("r", encoding="utf-8", errors="replace") as fh:
+                candidates = [ln.strip() for ln in fh if ln.strip()]
+        elif getattr(args, "candidates", None):
+            candidates = [c.strip() for c in str(args.candidates).split(",") if c.strip()]
+        if not candidates:
+            print("Error: at least one candidate translation must be supplied.", file=sys.stderr)
+            return 1
+    except Exception as exc:
+        print(f"Error reading candidate translations: {exc}", file=sys.stderr)
+        return 1
 
-if __name__ == "__main__":
-    sys.exit(main())
+    # ------------------------------------------------------------------
+    # Run ranking/ confidence calculation
+    # ------------------------------------------------------------------
+    try:
+        results = calculate_translation_confidence(
+            source_text=source_text,
+            candidates=candidates,
+            model_name=getattr(args, "model", "all-MiniLM-L6-v2"),
+            confidence_method=getattr(args, "confidence_method", "distribution"),
+            include_diagnostics=bool(getattr(args, "include_diagnostics", False)),
+        )
+    except Exception as exc:
+        print(f"Error during ranking: {exc}", file=sys.stderr)
+        return 1
+
+    payload: dict[str, object] = {"source_text": source_text, **results}
+
+    # ------------------------------------------------------------------
+    # Serialise output in the requested format
+    # ------------------------------------------------------------------
+    fmt = str(getattr(args, "output_format", "json")).lower()
+    output_str: str = ""
+
+    if fmt == "json":
+        output_str = json.dumps(payload, ensure_ascii=False)
+    elif fmt == "yaml":
+        if not _HAS_YAML:
+            print("Error: PyYAML not available but --output-format yaml requested.", file=sys.stderr)
+            return 1
+        output_str = yaml.safe_dump(payload, allow_unicode=True)
+    elif fmt == "csv":
+        import csv
+        import io
+        buffer = io.StringIO()
+        writer = csv.DictWriter(buffer, fieldnames=["translation", "similarity", "confidence"])
+        writer.writeheader()
+        for item in payload.get("ranked_translations", []):
+            writer.writerow({
+                "translation": item.get("translation", ""),
+                "similarity": item.get("similarity", 0),
+                "confidence": item.get("confidence", 0),
+            })
+        output_str = buffer.getvalue()
+    elif fmt == "table":
+        # Rich table to stdout (no capture in tests for this format)
+        try:
+            from rich.table import Table
+            from rich.console import Console
+            _console = Console()
+            table = Table(show_header=True, header_style="bold magenta")
+            table.add_column("Rank", justify="right")
+            table.add_column("Similarity", justify="right")
+            table.add_column("Confidence", justify="right")
+            table.add_column("Translation")
+            for idx, item in enumerate(payload.get("ranked_translations", []), start=1):
+                table.add_row(
+                    str(idx),
+                    f"{item.get('similarity', 0):.4f}",
+                    f"{item.get('confidence', 0):.4f}",
+                    item.get("translation", ""),
+                )
+            _console.print(table)
+            output_str = ""  # Already printed via rich
+        except Exception as exc:
+            print(f"Error generating table output: {exc}", file=sys.stderr)
+            return 1
+    elif fmt == "html":
+        output_str = output_html(payload, title="Candidate Ranking", include_diagnostics=bool(getattr(args, "include_diagnostics", False)))
+    else:
+        print(f"Error: unknown output format '{fmt}'.", file=sys.stderr)
+        return 1
+
+    # ------------------------------------------------------------------
+    # Persist/ print results
+    # ------------------------------------------------------------------
+    try:
+        if getattr(args, "output_file", None):
+            out_path = Path(args.output_file)
+            out_path.write_text(output_str, encoding="utf-8")
+        else:
+            if output_str:
+                print(output_str)
+        return 0
+    except Exception as exc:
+        print(f"Error writing output: {exc}", file=sys.stderr)
+        return 1
+
+if __name__ == '__main__':
+    try:
+        main()
+    except Exception as e:
+        if performance_monitor:
+            # Try to save performance data even if there's an error
+            try:
+                performance_monitor.save_statistics("error_stats.json")
+                performance_monitor.cleanup()
+            except:
+                pass
+        
+        if smart_cache_available:
+            # Ensure cache is properly shutdown
+            try:
+                smart_cache.shutdown()
+            except:
+                pass
+                
+        logging.critical(f"Unhandled exception in main: {e}\n{traceback.format_exc()}")
+        print(f"Critical error: {str(e)}")
+        sys.exit(1)

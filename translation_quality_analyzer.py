@@ -26,6 +26,12 @@ from translation_ranker import (
 
 # Optional Groq integration
 try:
+    from groq_evaluator import GroqTranslationEvaluator  # type: ignore
+except ImportError:  # pragma: no cover
+    GroqTranslationEvaluator = None  # type: ignore
+
+# Fallback to legacy name
+try:
     from groq_evaluator import GroqEvaluator  # type: ignore
 except ImportError:  # pragma: no cover
     GroqEvaluator = None  # type: ignore
@@ -137,8 +143,25 @@ class TranslationQualityAnalyzer:
         else:
             self.config_manager = config_manager
             
-        # Initialize Groq evaluator if not provided
-        self.groq_evaluator = groq_evaluator
+        # Initialise Groq evaluator if not provided
+        if groq_evaluator is not None:
+            self.groq_evaluator = groq_evaluator
+        else:
+            # Prefer the modern class if available
+            if GroqTranslationEvaluator is not None:
+                try:
+                    from groq_client import GroqClient  # local import to avoid heavy deps on startup
+                    self.groq_evaluator = GroqTranslationEvaluator(client=GroqClient())  # type: ignore[arg-type]
+                except Exception:  # pragma: no cover – client may be unconfigured
+                    self.groq_evaluator = None
+            elif GroqEvaluator is not None:
+                try:
+                    from groq_client import GroqClient
+                    self.groq_evaluator = GroqEvaluator(client=GroqClient())  # type: ignore[arg-type]
+                except Exception:
+                    self.groq_evaluator = None
+            else:
+                self.groq_evaluator = None
         
     def analyze_pair(self, source_text, translation, use_groq=False, detailed=False, 
                     detect_weak_alignments=False, segment_type=None, custom_weights=None):
@@ -501,13 +524,21 @@ class TranslationQualityAnalyzer:
         total_weight = 0
         
         # Process each component group
+        group_weight_mapping = {
+            "embedding": "embedding_metrics_weight",
+            "alignment": "alignment_metrics_weight", 
+            "groq_simple": "groq_simple_metrics_weight",
+            "groq_detailed": "groq_detailed_metrics_weight"
+        }
+        
         for group, data in components.items():
             if data["weight"] > 0:
                 # Calculate group score
                 group_score = data["score"] / data["weight"]
                 
-                # Apply group weight
-                group_weight = weights[f"{group}_weight"]
+                # Apply group weight using correct mapping
+                group_weight_key = group_weight_mapping.get(group, f"{group}_weight")
+                group_weight = weights.get(group_weight_key, 0.5)  # Default weight if not found
                 
                 final_score += group_score * group_weight
                 total_weight += group_weight
