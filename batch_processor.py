@@ -189,6 +189,7 @@ class AsyncBatchProcessor:
         embedding_generator: Optional[Any] = None,
         groq_evaluator: Optional[Any] = None,
         quality_analyzer: Optional[Any] = None,
+        quality_engine: Optional[Any] = None,
         error_handler: Optional[ErrorHandler] = None,
         progress_tracker: Optional[ProgressTracker] = None,
         smart_cache: Optional[SmartCache] = None,
@@ -205,6 +206,7 @@ class AsyncBatchProcessor:
             embedding_generator: Optional embedding generator for embeddings
             groq_evaluator: Optional Groq evaluator for quality assessment
             quality_analyzer: Optional quality analyzer for combined analysis
+            quality_engine: Optional quality learning engine for tier/confidence
             error_handler: Optional custom error handler
             progress_tracker: Optional custom progress tracker
             smart_cache: Optional smart cache for caching results
@@ -279,6 +281,7 @@ class AsyncBatchProcessor:
         self.embedding_generator = embedding_generator
         self.groq_evaluator = groq_evaluator
         self.quality_analyzer = quality_analyzer
+        self.quality_engine = quality_engine
         
         # Status and control
         self.running = False
@@ -598,6 +601,39 @@ class AsyncBatchProcessor:
                     "error": "No processing components available",
                     "analysis_timestamp": datetime.now().isoformat()
                 }
+            
+            # ------------------------------------------------------------------
+            # Optionally enhance with quality tier/confidence using learning engine
+            # ------------------------------------------------------------------
+            if (
+                self.quality_engine
+                and "embedding_similarity" in result
+                and (
+                    "overall_score" in result or "groq_quality_score" in result
+                )
+            ):
+                try:
+                    similarity_score = float(result["embedding_similarity"])
+                    if "overall_score" in result:
+                        groq_rating = float(result["overall_score"]) / 10.0
+                    else:
+                        groq_rating = float(result["groq_quality_score"])
+
+                    combined_score = 0.6 * similarity_score + 0.4 * groq_rating
+
+                    report = self.quality_engine.get_quality_report(
+                        source_lang=source_lang,
+                        target_lang=target_lang,
+                        similarity_score=similarity_score,
+                        groq_rating=groq_rating,
+                        combined_score=combined_score,
+                    )
+
+                    # Attach summary fields to result
+                    result["quality_tier"] = report["quality_tier"]
+                    result["quality_confidence"] = report["confidence"]["level"]
+                except Exception as e:
+                    logger.error(f"Failed to append quality tier: {e}")
             
             # Cache the result
             self.smart_cache.set(cache_key, result)
@@ -1061,7 +1097,8 @@ class BatchProcessor:
         max_workers: int = 4,
         checkpoint_dir: Optional[str] = None,
         error_handler: Optional[ErrorHandler] = None,
-        progress_tracker: Optional[ProgressTracker] = None
+        progress_tracker: Optional[ProgressTracker] = None,
+        quality_engine: Optional[Any] = None
     ):
         """
         Initialize the synchronous batch processor adapter.
@@ -1075,6 +1112,7 @@ class BatchProcessor:
             checkpoint_dir: Directory for checkpoint files
             error_handler: Optional error handler
             progress_tracker: Optional progress tracker
+            quality_engine: Optional quality learning engine for tier/confidence
         """
         # Create a config from the parameters
         config = {
@@ -1090,6 +1128,7 @@ class BatchProcessor:
             input_dir=input_dir,
             output_dir=output_dir,
             config=config,
+            quality_engine=quality_engine,
             error_handler=error_handler,
             progress_tracker=progress_tracker,
             interactive=False
