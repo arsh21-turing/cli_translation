@@ -59,6 +59,9 @@ python main.py evaluate -st "Hello" -tt "Bonjour"
 # Force Groq usage (if you have an API key configured)
 python main.py evaluate -st "Hello" -tt "Bonjour" --use-groq
 
+# File-based evaluation via sub-command
+python main.py evaluate -sf source.txt -tf target.txt
+
 # ---------------------------------------------------------------------------
 # METRICS SUB-COMMAND (placeholder)
 # ---------------------------------------------------------------------------

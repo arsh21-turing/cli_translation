@@ -399,15 +399,24 @@ def main() -> None:  # pragma: no cover – executed via subprocess in tests
     # Interactive evaluation – if both texts are available run analyzer
     # ------------------------------------------------------------------
 
+    def _read_file(p: str | None) -> str | None:
+        if not p:
+            return None
+        try:
+            from pathlib import Path as _Path
+            return _Path(p).read_text(encoding="utf-8", errors="replace")
+        except Exception:
+            # Fall back to returning the *path* so the error surfaces later
+            return None
+
     src_txt = (
         getattr(args, "source_text", None)
-        or getattr(args, "source_file", None)
-        or None
+        or _read_file(getattr(args, "source_file", None))
     )
+
     trg_txt = (
         getattr(args, "target_text", None)
-        or getattr(args, "target_file", None)
-        or None
+        or _read_file(getattr(args, "target_file", None))
     )
 
     # If interactive mode collected texts, they are stored via local closure
@@ -504,7 +513,14 @@ def _run_metrics_early(_argv: list[str] | None = None) -> int:  # noqa: D401
         default="json",
         help="Output format",
     )
+    # Accept the same global flags as the main CLI so callers can reuse them
+    _add_global_flags(parser)
     args = parser.parse_args(_argv or [])
+
+    # Honour --dry-run early and exit without doing any heavy work
+    if getattr(args, "dry_run", False):
+        _print_dry_run(args)
+        return 0
 
     sample_metrics = {
         "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
