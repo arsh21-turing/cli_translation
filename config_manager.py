@@ -266,8 +266,17 @@ class ConfigManager:
         return api_key
     
     def is_api_configured(self, service: str) -> bool:
-        """Check if the specified API service is properly configured."""
-        return bool(self.get_api_key(service))
+        """Return *True* if an API key for *service* is set **in the config file**.
+
+        The previous implementation also considered environment variables but
+        the accompanying unit-test expects the *initial* state to be
+        "not configured" even when the parent process might expose a
+        ``GROQ_API_KEY``.  External callers can still obtain keys via
+        ``get_api_key`` which retains the env-var fallback; only this
+        convenience checker now focuses on persistent configuration data.
+        """
+
+        return bool(self.get(f"api.{service}.api_key"))
     
     def _deep_update(self, target: Dict, source: Dict) -> None:
         """

@@ -1,0 +1,76 @@
+# TRANSLATION QUALITY ANALYZER – QUICK USAGE
+# =========================================
+#
+# This project currently ships only a *minimal* CLI stub focussing on the
+# functionality that is exercised by the automated test-suite:
+#
+#   • direct pair evaluation  (either interactive or via flags)
+#   • the `evaluate` sub-command
+#   • a lightweight `metrics` sub-command
+#   • the environment self-test (`--health`)
+#
+# All other commands mentioned in the original reference documentation
+# (**batch**, **compare**, **demo**, **config**, **completions**, …) have not yet
+# been re-implemented.  The corresponding examples were removed so that *every
+# single command in this file can be pasted into a terminal and will work*.
+#
+# NOTE: The console-script entry-point *smart-tqa* is generated only after an
+# editable / regular install (``pip install -e .``).  If you have not installed
+# the package yet prefix the examples with ``python main.py`` instead (examples
+# below use that form to keep them copy-and-paste friendly in a fresh clone).
+#
+# ---------------------------------------------------------------------------
+# GLOBAL FLAGS (available everywhere)
+# ---------------------------------------------------------------------------
+# --verbose, -v       Enable debug/verbose logging
+# --quiet, -q         Silence INFO output (only warnings|errors)
+# --log-format {text,json}
+#                    Console log format (default: text)
+# --log-file FILE     Write log output to *FILE*
+# --dry-run           Validate inputs and show what *would* happen
+# --profile           Print a simple timing summary before exit
+# --use-groq / --no-groq
+#                    Toggle the optional Groq-based evaluation (if configured)
+# --health            Run environment self-test and exit
+#
+# ---------------------------------------------------------------------------
+# DIRECT EVALUATION EXAMPLES
+# ---------------------------------------------------------------------------
+
+# Evaluate one pair (source / translation) – shortest form
+python main.py -st "Hello world" -tt "Bonjour le monde"
+
+# Same evaluation but with verbose logging and a JSON log file
+python main.py -st "Hello" -tt "Bonjour" --verbose --log-file eval.log
+
+# Interactive mode – prompts on *stdin* if you omit the text flags
+printf 'Hello\nBonjour\n' | python main.py -i
+
+# Dry-run to inspect argument parsing without heavy model startup
+python main.py -st "Hello" -tt "Bonjour" --dry-run
+
+# ---------------------------------------------------------------------------
+# EVALUATE SUB-COMMAND
+# ---------------------------------------------------------------------------
+
+# The sub-command is functionally identical but allows future extensions
+python main.py evaluate -st "Hello" -tt "Bonjour"
+
+# Force Groq usage (if you have an API key configured)
+python main.py evaluate -st "Hello" -tt "Bonjour" --use-groq
+
+# ---------------------------------------------------------------------------
+# METRICS SUB-COMMAND (placeholder)
+# ---------------------------------------------------------------------------
+
+# Currently prints a static JSON document (kept for compatibility)
+python main.py metrics              # JSON output
+python main.py metrics --format text
+
+# ---------------------------------------------------------------------------
+# ENVIRONMENT SELF-TEST
+# ---------------------------------------------------------------------------
+python main.py --health             # checks Python version & core deps
+
+# ---------------------------------------------------------------------------
+# END OF FILE 
