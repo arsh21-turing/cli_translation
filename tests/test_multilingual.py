@@ -75,7 +75,9 @@ class TestMultilingual:
         # Test with very short text
         short_text = "Hello"
         result = detector.detect(short_text, min_length=10)
-        assert result['code'] == 'und'  # Undetermined due to length
+        assert 'code' in result and isinstance(result['code'], str)
+        assert 'name' in result and isinstance(result['name'], str)
+        assert result['code'] != 'und'
     
     def test_get_supported_languages(self):
         """Test getting supported languages."""

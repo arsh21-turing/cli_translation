@@ -71,9 +71,21 @@ class LanguageDetector:
         Returns:
             Dict: {'code': 'en', 'name': 'English', 'confidence': 0.92, 'family': 'germanic'}
         """
-        if not text or len(text) < min_length:
-            logger.warning(f"Text too short ({len(text) if text else 0} chars) for reliable detection")
-            return {'code': 'und', 'name': 'Undetermined', 'confidence': 0.0, 'family': None}
+        # Empty input yields undetermined immediately
+        if not text:
+            return {
+                'code': 'und',
+                'name': 'Undetermined',
+                'confidence': 0.0,
+                'family': None,
+            }
+
+        # Warn about very short input but still attempt detection instead of bailing out
+        if len(text) < min_length:
+            logger.warning(
+                "Text too short (%d chars) – attempting language detection anyway, results may be unreliable",
+                len(text),
+            )
         
         # Try FastText detection if available
         if self.fasttext_model:

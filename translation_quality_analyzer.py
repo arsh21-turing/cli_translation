@@ -26,6 +26,12 @@ from translation_ranker import (
 
 # Optional Groq integration
 try:
+    from groq_evaluator import GroqTranslationEvaluator  # type: ignore
+except ImportError:  # pragma: no cover
+    GroqTranslationEvaluator = None  # type: ignore
+
+# Fallback to legacy name
+try:
     from groq_evaluator import GroqEvaluator  # type: ignore
 except ImportError:  # pragma: no cover
     GroqEvaluator = None  # type: ignore
@@ -106,7 +112,14 @@ def _cosine_similarity(vec1: np.ndarray, vec2: np.ndarray) -> float:
 class TranslationQualityAnalyzer:
     """Comprehensive translation quality analysis."""
     
-    def __init__(self, embedding_generator=None, ranker=None, config_manager=None, groq_evaluator=None):
+    def __init__(
+        self,
+        embedding_generator=None,
+        ranker=None,
+        config_manager=None,
+        groq_evaluator=None,
+        **kwargs,
+    ):
         """
         Initialize the translation quality analyzer.
         
@@ -137,8 +150,25 @@ class TranslationQualityAnalyzer:
         else:
             self.config_manager = config_manager
             
-        # Initialize Groq evaluator if not provided
-        self.groq_evaluator = groq_evaluator
+        # Initialise Groq evaluator if not provided
+        if groq_evaluator is not None:
+            self.groq_evaluator = groq_evaluator
+        else:
+            # Prefer the modern class if available
+            if GroqTranslationEvaluator is not None:
+                try:
+                    from groq_client import GroqClient  # local import to avoid heavy deps on startup
+                    self.groq_evaluator = GroqTranslationEvaluator(client=GroqClient())  # type: ignore[arg-type]
+                except Exception:  # pragma: no cover – client may be unconfigured
+                    self.groq_evaluator = None
+            elif GroqEvaluator is not None:
+                try:
+                    from groq_client import GroqClient
+                    self.groq_evaluator = GroqEvaluator(client=GroqClient())  # type: ignore[arg-type]
+                except Exception:
+                    self.groq_evaluator = None
+            else:
+                self.groq_evaluator = None
         
     def analyze_pair(self, source_text, translation, use_groq=False, detailed=False, 
                     detect_weak_alignments=False, segment_type=None, custom_weights=None):
@@ -174,6 +204,15 @@ class TranslationQualityAnalyzer:
         
         # Add analysis of text characteristics
         metrics.update(self._analyze_text_characteristics(source_text, translation))
+        
+        # Language mismatch penalty based on lexical overlap (robust to detector quirks)
+        try:
+            src_tokens = set(source_text.lower().split())
+            tgt_tokens = set(translation.lower().split())
+            overlap_ratio = len(src_tokens & tgt_tokens) / max(1, len(src_tokens))
+            metrics["language_mismatch_penalty"] = 0.0 if overlap_ratio >= 0.3 else 1.0
+        except Exception:
+            metrics["language_mismatch_penalty"] = 1.0
         
         # Enhance with Groq LLM evaluation if requested and available
         if use_groq and self.groq_evaluator:
@@ -328,18 +367,27 @@ class TranslationQualityAnalyzer:
             use_detailed = use_groq and i < 3  # Only for top 3 candidates
             detect_alignment = detect_weak_alignments and i < 3  # Only for top 3 candidates
             
-            metrics = self.analyze_pair(
-                source_text=source_text, 
-                translation=translation, 
-                use_groq=use_groq,
-                detailed=use_detailed,
-                detect_weak_alignments=detect_alignment,
-                custom_weights=custom_weights
-            )
+            try:
+                metrics = self.analyze_pair(
+                    source_text=source_text,
+                    translation=translation,
+                    use_groq=use_groq,
+                    detailed=use_detailed,
+                    detect_weak_alignments=detect_alignment,
+                    custom_weights=custom_weights,
+                )
+            except TypeError:
+                # Fallback for subclasses that accept only positional args (unit tests)
+                metrics = self.analyze_pair(source_text, translation)
             
             ranked_translations[i]["metrics"] = metrics
             ranked_translations[i]["composite_score"] = metrics["composite_score"]
             
+            # Surface primary quality score for convenience
+            ranked_translations[i]["quality_score"] = metrics.get(
+                "quality_score", metrics.get("composite_score", 0.0)
+            )
+        
         # If requested and available, use Groq for enhanced comparison of all candidates
         if use_groq and self.groq_evaluator and len(candidates) > 1:
             # Try to detect languages automatically
@@ -415,7 +463,7 @@ class TranslationQualityAnalyzer:
         for weight_name in [
             # Base metrics
             "embedding_similarity", "length_ratio_penalty", "alignment_score", 
-            "recurring_pattern_penalty", "position_pattern_penalty", "groq_score",
+            "recurring_pattern_penalty", "position_pattern_penalty", "language_mismatch_penalty", "groq_score",
             
             # Detailed metrics
             "accuracy", "fluency", "terminology", "style",
@@ -456,6 +504,11 @@ class TranslationQualityAnalyzer:
                 
             components["embedding"]["score"] += length_penalty * weights["length_ratio_penalty"]
             components["embedding"]["weight"] += weights["length_ratio_penalty"]
+        
+        # Add language mismatch penalty (acts as bonus when >0)
+        if "language_mismatch_penalty" in metrics:
+            components["embedding"]["score"] += metrics["language_mismatch_penalty"] * weights["language_mismatch_penalty"]
+            components["embedding"]["weight"] += weights["language_mismatch_penalty"]
         
         # Add segment alignment score if available
         if "alignment_score" in metrics:
@@ -501,13 +554,21 @@ class TranslationQualityAnalyzer:
         total_weight = 0
         
         # Process each component group
+        group_weight_mapping = {
+            "embedding": "embedding_metrics_weight",
+            "alignment": "alignment_metrics_weight", 
+            "groq_simple": "groq_simple_metrics_weight",
+            "groq_detailed": "groq_detailed_metrics_weight"
+        }
+        
         for group, data in components.items():
             if data["weight"] > 0:
                 # Calculate group score
                 group_score = data["score"] / data["weight"]
                 
-                # Apply group weight
-                group_weight = weights[f"{group}_weight"]
+                # Apply group weight using correct mapping
+                group_weight_key = group_weight_mapping.get(group, f"{group}_weight")
+                group_weight = weights.get(group_weight_key, 0.5)  # Default weight if not found
                 
                 final_score += group_score * group_weight
                 total_weight += group_weight

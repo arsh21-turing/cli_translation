@@ -21,6 +21,9 @@ import numpy as np
 import logging
 import math
 import itertools
+import matplotlib.pyplot as plt
+import seaborn as sns
+from dataclasses import dataclass
 
 # from similarity_calculator import cosine_similarity  # local util
 
@@ -48,6 +51,20 @@ def _paragraph_split(text: str) -> List[str]:
 # -----------------------------------------------------------------------------
 # Core analyser
 # -----------------------------------------------------------------------------
+
+@dataclass
+class SegmentAlignment:
+    source_segment: str
+    target_segment: str
+    similarity_score: float
+    groq_rating: Optional[float] = None
+    combined_score: Optional[float] = None
+    position: Optional[Tuple[int, int]] = None
+    issues: Optional[List[str]] = None
+    
+    def __post_init__(self):
+        if self.issues is None:
+            self.issues = []
 
 class SegmentAlignmentAnalyzer:
     """
@@ -1320,3 +1337,109 @@ class SlidingWindowAligner:
     # Public method that unit tests patch
     def _calculate_raw_alignment(self, source_text: str, translation_text: str):
         return self._raw_alignment_internal(source_text, translation_text) 
+
+def visualize_alignment(self, alignments: List[SegmentAlignment], output_path: str = None) -> None:
+    """
+    Create visualization of alignments.
+    
+    Args:
+        alignments: List of segment alignments
+        output_path: Path to save visualization (if None, just displays)
+    """
+    # Only create visualization if we have matplotlib
+    try:
+        plt.figure(figsize=(10, 6))
+        
+        # Prepare data
+        positions = [a.position[0] for a in alignments if a.position]
+        
+        # Choose scores based on what's available
+        scores = []
+        for a in alignments:
+            if a.combined_score is not None:
+                scores.append(a.combined_score)
+            else:
+                scores.append(a.similarity_score)
+        
+        # Create scatter plot of scores
+        plt.scatter(positions, scores, alpha=0.7)
+        
+        # Add a line for the threshold
+        plt.axhline(y=0.7, color='r', linestyle='--', alpha=0.5, label='Weak alignment threshold')
+        
+        # Add labels and title
+        plt.xlabel('Segment Position')
+        plt.ylabel('Alignment Score')
+        plt.title('Segment Alignment Scores')
+        plt.legend()
+        
+        # Add grid
+        plt.grid(True, alpha=0.3)
+        
+        # Save or show
+        if output_path:
+            plt.savefig(output_path)
+        else:
+            plt.show()
+            
+    except Exception as e:
+        logger.error(f"Failed to create visualization: {e}")
+
+def calculate_alignment_statistics(self, alignments: List[SegmentAlignment]) -> Dict[str, float]:
+    """
+    Calculate statistical measures for alignments.
+    
+    Args:
+        alignments: List of segment alignments
+        
+    Returns:
+        Dictionary of statistical measures
+    """
+    stats = {}
+    
+    # Get appropriate scores
+    scores = []
+    similarity_scores = []
+    groq_scores = []
+    combined_scores = []
+    
+    for a in alignments:
+        similarity_scores.append(a.similarity_score)
+        if a.groq_rating is not None:
+            groq_scores.append(a.groq_rating)
+        if a.combined_score is not None:
+            combined_scores.append(a.combined_score)
+            scores.append(a.combined_score)
+        else:
+            scores.append(a.similarity_score)
+    
+    # Calculate basic statistics
+    stats['mean_score'] = np.mean(scores) if scores else 0
+    stats['median_score'] = np.median(scores) if scores else 0
+    stats['min_score'] = min(scores) if scores else 0
+    stats['max_score'] = max(scores) if scores else 0
+    stats['std_dev'] = np.std(scores) if scores else 0
+    
+    # Add similarity-specific stats
+    stats['mean_similarity'] = np.mean(similarity_scores) if similarity_scores else 0
+    stats['median_similarity'] = np.median(similarity_scores) if similarity_scores else 0
+    
+    # Add Groq-specific stats if available
+    if groq_scores:
+        stats['mean_groq'] = np.mean(groq_scores)
+        stats['median_groq'] = np.median(groq_scores)
+        # Calculate correlation between similarity and Groq scores for segments that have both
+        pairs = [(a.similarity_score, a.groq_rating) for a in alignments if a.groq_rating is not None]
+        if pairs:
+            sim_scores, groq_ratings = zip(*pairs)
+            try:
+                stats['similarity_groq_correlation'] = np.corrcoef(sim_scores, groq_ratings)[0, 1]
+            except:
+                stats['similarity_groq_correlation'] = 0
+    
+    # Add combined score stats if available
+    if combined_scores:
+        stats['mean_combined'] = np.mean(combined_scores)
+        stats['median_combined'] = np.median(combined_scores)
+    
+    return stats 

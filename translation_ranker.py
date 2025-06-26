@@ -35,6 +35,7 @@ class TranslationRanker:
         self,
         similarity_calculator: Optional[SimilarityCalculator] = None,
         metric: str = "cosine",
+        **kwargs,
     ) -> None:
         """Create a TranslationRanker.
 
